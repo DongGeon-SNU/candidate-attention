@@ -1,0 +1,8 @@
+# Install only inside zslee/dllm_candidate_probe/.venv on the shared-GPU volume.
+# The CUDA-compatible torch wheel is selected by scripts/setup.sh for its target.
+transformers>=4.51,<5
+huggingface_hub>=0.30
+safetensors>=0.5
+PyYAML>=6.0
+numpy>=1.26
+matplotlib>=3.9

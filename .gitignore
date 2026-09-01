@@ -1,0 +1,33 @@
+# Secrets
+.env
+.env.*
+*.env
+
+# Python and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Hugging Face/model caches and downloaded vendor code
+.cache/huggingface/
+huggingface/
+hf_cache/
+cache/huggingface/
+zslee/dllm_candidate_probe/cache/
+zslee/dllm_candidate_probe/vendor/
+
+# Model weights and derived checkpoints
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+checkpoints/
+models/
+
+# Experiment artifacts
+runs/
+outputs/
+logs/

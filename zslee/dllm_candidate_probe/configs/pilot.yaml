@@ -1,0 +1,45 @@
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
+  # Verified 2026-09-02; pin instead of using an unrecorded moving branch.
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto  # BF16 when supported; otherwise FP16. No quantization.
+
+decoding:
+  seed: 20260902
+  threshold: 0.9
+  temperature: 0.0
+  generation_length: 16
+  steps: 16
+  use_cache_for_state_collection: true
+  tau_mass: 0.8
+  max_candidate_positions: 4
+  candidates_per_position: 5
+  low_parallel_max_transferred: 2
+  low_parallel_remaining_fraction: 0.10
+
+probe:
+  branch_microbatch: 1
+  set_sizes: [3, 4]
+  set_beam_width: 8
+  max_sets_per_state: 8
+  pair_stability_thresholds: [0.3, 0.5, 0.7, 0.9]
+  set_stability_thresholds: [0.3, 0.5, 0.7, 0.9]
+  epsilon: 1.0e-12
+
+smoke_prompts:
+  - "Solve briefly: If 3 apples cost $6, what is the cost of 5 apples?"
+  - "Give a one-sentence explanation of why rainbows have colors."
+
+pilot_prompts:
+  - "Solve briefly: If 3 apples cost $6, what is the cost of 5 apples?"
+  - "Give a one-sentence explanation of why rainbows have colors."
+  - "What is the next number in 2, 4, 8, 16? Explain briefly."
+  - "Translate 'good morning' into French."
+  - "A rectangle is 4 by 7. What is its area?"
+  - "Name the largest planet in the solar system."
+  - "If a train leaves at noon and travels 60 km in one hour, how far after 3 hours?"
+  - "State one difference between a mammal and a reptile."
+  - "What is 15 percent of 200?"
+  - "Write one synonym for 'rapid'."
