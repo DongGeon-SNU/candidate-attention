@@ -39,6 +39,19 @@ class FrozenToyModel(torch.nn.Module):
         return _Output(logits)
 
 
+class PositionlessToyModel(torch.nn.Module):
+    """Matches Fast-dLLM LLaDA's public forward signature."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.anchor = torch.nn.Parameter(torch.ones(()))
+        self.seen = None
+
+    def forward(self, *, input_ids, attention_mask, use_cache):
+        self.seen = {"input_ids": input_ids.detach().clone(), "attention_mask": attention_mask.detach().clone(), "use_cache": use_cache}
+        return _Output(torch.nn.functional.one_hot(input_ids % 7, num_classes=7).float())
+
+
 class ModelSemanticsTest(unittest.TestCase):
     def test_exact_forward_is_no_cache_and_keeps_position_ids(self) -> None:
         model = FrozenToyModel()
@@ -56,6 +69,16 @@ class ModelSemanticsTest(unittest.TestCase):
     def test_probability_distribution_sums_to_one(self) -> None:
         logits = torch.tensor([[[0.0, 1.0, 2.0], [3.0, -1.0, 0.0]]])
         self.assertTrue(torch.allclose(probabilities(logits).sum(dim=-1), torch.ones((1, 2))))
+
+    def test_positionless_llada_style_model_uses_fixed_length_internal_positions(self) -> None:
+        model = PositionlessToyModel()
+        input_ids = torch.tensor([[1, 99, 99, 4]])
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(4).unsqueeze(0)
+        exact_forward(model, input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        self.assertEqual(model.seen["use_cache"], False)
+        self.assertTrue(torch.equal(model.seen["input_ids"], input_ids))
+        self.assertTrue(torch.equal(model.seen["attention_mask"], attention_mask))
 
     def test_same_seed_gives_same_counterfactual_logits(self) -> None:
         torch.manual_seed(123)

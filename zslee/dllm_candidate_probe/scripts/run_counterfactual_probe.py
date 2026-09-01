@@ -253,7 +253,7 @@ def exact_state_probe(
         "pairs": len(pair_rows),
         "sets": len(set_rows),
         "leave_one_out": "one exact no-cache forward per candidate in each selected set",
-        "position_ids": "identical base-derived tensor passed to every branch",
+        "position_ids": "passed unchanged when supported; Fast-dLLM LLaDA derives identical sequential positions internally from equal-length branches",
     }
     return base_record, pair_rows, set_rows
 

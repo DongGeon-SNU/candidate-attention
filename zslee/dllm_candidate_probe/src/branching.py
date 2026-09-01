@@ -9,6 +9,7 @@ counterfactual measurement.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -125,9 +126,12 @@ def exact_forward(
 ) -> Any:
     """Run one no-cache frozen forward pass and return logits.
 
-    ``attention_mask`` and ``position_ids`` are passed through unchanged from
-    the base state.  The model is put in eval mode on every call; no gradients
-    or KV cache are retained.
+    ``attention_mask`` is passed through unchanged from the base state. When a
+    model accepts ``position_ids``, that base-derived tensor is also passed
+    unchanged. Fast-dLLM's LLaDAModelLM does not expose a ``position_ids``
+    parameter; with its fixed-length branch inputs it deterministically derives
+    the same sequential position indices internally. The model is put in eval
+    mode on every call; no gradients or KV cache are retained.
     """
 
     try:
@@ -135,14 +139,20 @@ def exact_forward(
     except ImportError as error:  # pragma: no cover - exercised on GPU runtime
         raise RuntimeError("exact_forward requires the project's PyTorch environment.") from error
 
+    forward_parameters = inspect.signature(model.forward).parameters
+    accepts_position_ids = "position_ids" in forward_parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in forward_parameters.values()
+    )
+    kwargs = {
+        "input_ids": branch_input_ids,
+        "attention_mask": attention_mask,
+        "use_cache": False,
+    }
+    if accepts_position_ids:
+        kwargs["position_ids"] = position_ids
     model.eval()
     with torch.inference_mode():
-        output = model(
-            input_ids=branch_input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            use_cache=False,
-        )
+        output = model(**kwargs)
     if not hasattr(output, "logits"):
         raise TypeError("Model output must expose .logits.")
     return output.logits
