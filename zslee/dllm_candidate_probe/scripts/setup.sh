@@ -28,7 +28,8 @@ python3 "${PROBE_ROOT}/scripts/check_environment.py" \
   --output "${PROBE_ROOT}/outputs/environment_report.md"
 
 # This gate intentionally runs before any model/dependency download. It records
-# the exact reason if a PVC, 40 GiB disk headroom, HF_TOKEN, or GPU capacity is absent.
+# the exact reason if a PVC, 40 GiB disk headroom, or GPU capacity is absent.
+# HF_TOKEN is optional for this public model and is only needed if access fails.
 python3 "${PROBE_ROOT}/scripts/preflight.py" \
   --probe-root "${PROBE_ROOT}" \
   --environment-json "${PROBE_ROOT}/outputs/environment_report.json" \

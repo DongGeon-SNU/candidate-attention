@@ -18,16 +18,14 @@ cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
 
 - the project is on a likely-persistent mount (or the job owner has verified it and set `PERSISTENCE_CONFIRMED=1`);
 - there are at least 40 GiB free at the persistent root;
-- `HF_TOKEN` is present without printing it; and
 - one GPU has at least 20,000 MiB free, a conservative no-quantization BF16 budget for the roughly 16 GiB LLaDA checkpoint plus runtime memory.
 
-If model access is rejected, configure a Portainer/Kubernetes secret named `HF_TOKEN`; do not use interactive Hugging Face login. All Hugging Face and pip caches stay under `cache/` in this project. No service, deployment, or background process is created.
+`GSAI-ML/LLaDA-8B-Instruct` is public, so setup first attempts an unauthenticated download. Only if Hugging Face returns an access error should a Portainer/Kubernetes secret named `HF_TOKEN` be configured; do not use interactive Hugging Face login. All Hugging Face and pip caches stay under `cache/` in this project. No service, deployment, or background process is created.
 
 ## Commands
 
 ```bash
 export PERSISTENT_ROOT=/the/persistent/volume/root
-export HF_TOKEN=...  # inject this from the platform secret mechanism; never put it in a file
 bash scripts/setup.sh
 bash scripts/run_smoke.sh
 bash scripts/run_pilot.sh

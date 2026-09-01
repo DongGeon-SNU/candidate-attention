@@ -45,8 +45,9 @@ def main() -> None:
     free_gib = shutil.disk_usage(args.probe_root).free / 2**30
     if free_gib < MIN_DOWNLOAD_FREE_GIB:
         failures.append(f"only {free_gib:.2f} GiB free; at least {MIN_DOWNLOAD_FREE_GIB:.0f} GiB is required before download")
+    warnings: list[str] = []
     if environment["hf_authentication"] != "authenticated":
-        failures.append("HF_TOKEN is not detected (set this secret environment variable if model access is denied)")
+        warnings.append("HF_TOKEN is not detected; attempting the public model download without authentication")
     rows = nvidia_rows()
     if not rows:
         failures.append("nvidia-smi did not expose a usable GPU")
@@ -60,7 +61,9 @@ def main() -> None:
     if failures:
         print("PRECHECK BLOCKED: " + "; ".join(failures), file=sys.stderr)
         raise SystemExit(3)
-    print(f"PRECHECK PASSED for {args.stage}: persistence, disk, HF auth, and GPU capacity are sufficient.")
+    print(f"PRECHECK PASSED for {args.stage}: persistence, disk, and GPU capacity are sufficient.")
+    for warning in warnings:
+        print("PRECHECK NOTE: " + warning)
 
 
 if __name__ == "__main__":
