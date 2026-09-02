@@ -34,7 +34,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--probe-root", type=Path, required=True)
     parser.add_argument("--environment-json", type=Path, required=True)
-    parser.add_argument("--stage", choices=("setup", "smoke", "pilot"), required=True)
+    parser.add_argument("--stage", choices=("setup", "smoke", "pilot", "audit"), required=True)
     args = parser.parse_args()
 
     environment = json.loads(args.environment_json.read_text(encoding="utf-8"))
@@ -52,11 +52,16 @@ def main() -> None:
     if not rows:
         failures.append("nvidia-smi did not expose a usable GPU")
     else:
-        largest_free_mib = max(int(row[3]) for row in rows)
+        selected = max(rows, key=lambda row: int(row[3]))
+        largest_free_mib = int(selected[3])
         if largest_free_mib < MIN_UNQUANTIZED_MODEL_FREE_MIB:
             failures.append(
                 f"largest available GPU memory is {largest_free_mib} MiB; "
                 f"the unquantized BF16 LLaDA smoke test requires about {MIN_UNQUANTIZED_MODEL_FREE_MIB} MiB free"
+            )
+        if int(selected[2]) > int(selected[1]) // 2:
+            failures.append(
+                f"the least-busy usable GPU already has {selected[2]} MiB allocated; do not automatically add work to a heavily shared GPU"
             )
     if failures:
         print("PRECHECK BLOCKED: " + "; ".join(failures), file=sys.stderr)

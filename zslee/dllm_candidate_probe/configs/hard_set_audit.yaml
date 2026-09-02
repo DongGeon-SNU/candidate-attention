@@ -1,0 +1,44 @@
+# Continuation audit: reuses the completed pilot raw artifacts, then measures
+# exact leave-one-out set stability for pair-rule cliques.  No quantization.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  seed: 20260902
+  threshold: 0.9
+  tau_mass: 0.8
+  steps: 16
+  use_cache_for_state_collection: true
+
+pilot_reuse:
+  states: outputs/raw/pilot_states.jsonl
+  pairs: outputs/raw/pilot_pairs.jsonl
+  sets: outputs/raw/pilot_sets.jsonl
+  result: outputs/pilot_result.json
+  expected_fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  # The pilot's summary records this provenance; source changes must be
+  # explicitly reviewed before an old raw artifact is reused.
+  expected_probe_source_commit: 242ca1ab63ac0ccff258ed0427ed33bf51897502
+
+hard_set:
+  pair_thresholds: [0.5, 0.7, 0.8, 0.9]
+  lift_deltas: [0.0, 0.4054651081, 0.6931471806]
+  graphs: [stability_only, strict_mutual_support]
+  target_set_sizes: [3, 4, 6, 8]
+  policy_seeds: [20260902, 20260903, 20260904, 20260905]
+  primary_pair_threshold: 0.7
+  primary_lift_delta: 0.0
+  target_audited_sets_per_size: 500
+  primary_stress_sets_per_size: 100
+  non_primary_sets_per_size: 25
+  max_audited_sets_per_size: 1000
+  attempts_per_set: 100
+  smoke_state_limit: 2
+  smoke_sets_per_size: 5
+  singleton_match_tolerance: 1.0e-4
+  max_runtime_seconds: 1800
+  epsilon: 1.0e-12
