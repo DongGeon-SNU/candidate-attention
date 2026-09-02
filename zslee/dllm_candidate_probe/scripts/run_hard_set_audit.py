@@ -178,7 +178,9 @@ class ExactEvaluator:
             self.forward_seconds += time.perf_counter() - started
             self.forward_count += 1
             for target in missing:
-                probability = float(self.torch.softmax(logits[0, target.position], dim=-1)[target.token_id].item())
+                # Match the original pilot's ``probabilities(logits)`` exactly:
+                # BF16 model logits are promoted to FP32 before softmax.
+                probability = float(self.torch.softmax(logits[0, target.position].float(), dim=-1)[target.token_id].item())
                 self.cache.put(
                     keys[target.node_id], probability,
                     {

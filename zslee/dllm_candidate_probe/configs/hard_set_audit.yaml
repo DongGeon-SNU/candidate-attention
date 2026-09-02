@@ -45,6 +45,6 @@ hard_set:
   singleton_lift_match_tolerance: 1.0e-2
   # Bump only when scalar-key semantics change. Old cache rows stay available
   # for provenance but are never silently mixed with a new namespace.
-  exact_scalar_cache_schema: hard-set-v2
+  exact_scalar_cache_schema: hard-set-v3
   max_runtime_seconds: 1800
   epsilon: 1.0e-12

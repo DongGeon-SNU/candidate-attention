@@ -70,6 +70,13 @@ class ModelSemanticsTest(unittest.TestCase):
         logits = torch.tensor([[[0.0, 1.0, 2.0], [3.0, -1.0, 0.0]]])
         self.assertTrue(torch.allclose(probabilities(logits).sum(dim=-1), torch.ones((1, 2))))
 
+    def test_counterfactual_scalar_softmax_uses_float_logits(self) -> None:
+        # The hard-set scalar cache must use the same FP32-softmax convention as
+        # the pilot's probabilities(logits), rather than persist BF16 rounding.
+        logits = torch.tensor([0.0, -4.75, -7.25], dtype=torch.bfloat16)
+        expected = torch.softmax(logits.float(), dim=-1)[1]
+        self.assertEqual(probabilities(logits.unsqueeze(0).unsqueeze(0))[0, 0, 1].item(), expected.item())
+
     def test_positionless_llada_style_model_uses_fixed_length_internal_positions(self) -> None:
         model = PositionlessToyModel()
         input_ids = torch.tensor([[1, 99, 99, 4]])
