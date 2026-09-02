@@ -442,16 +442,24 @@ def make_figures(output_dir: Path, audit_rows: list[Mapping[str, Any]], conflict
         plt.close(figure)
         created.append("failure_gap_distribution.png")
     if conflict_rows:
-        by_threshold: dict[float, list[Mapping[str, Any]]] = defaultdict(list)
+        by_condition_threshold: dict[tuple[str, float, float], list[Mapping[str, Any]]] = defaultdict(list)
         for row in conflict_rows:
-            by_threshold[float(row["pair_threshold"])].append(row)
+            if int(row["anchor_count"]) >= 2:
+                by_condition_threshold[(str(row["graph"]), float(row["lift_delta"]), float(row["pair_threshold"]))].append(row)
         figure, axis = plt.subplots(figsize=(6, 4))
-        thresholds = sorted(by_threshold)
-        rates = [sum(bool(row["anchor_conflict"]) for row in by_threshold[value]) / len(by_threshold[value]) for value in thresholds]
-        axis.bar([str(value) for value in thresholds], rates, color="#a05a2c")
+        condition_series: dict[tuple[str, float], list[tuple[float, float]]] = defaultdict(list)
+        for (graph, delta, threshold), rows in by_condition_threshold.items():
+            condition_series[(graph, delta)].append(
+                (threshold, sum(bool(row["anchor_conflict"]) for row in rows) / len(rows))
+            )
+        for (graph, delta), values in sorted(condition_series.items()):
+            values.sort()
+            label = "stability-only" if graph == "stability_only" else f"strict, delta={delta:g}"
+            axis.plot([value[0] for value in values], [value[1] for value in values], marker="o", label=label)
         axis.set_xlabel("pair threshold")
         axis.set_ylabel("anchor-conflict state rate")
         axis.set_ylim(0, 1)
+        axis.legend(fontsize=8)
         figure.tight_layout()
         figure.savefig(output_dir / "anchor_conflict_by_threshold.png", dpi=160)
         plt.close(figure)
@@ -579,9 +587,23 @@ def write_reports(
             lines.append(f"3. Strict mutual support at tau=0.7, delta=0.0: {strict_failures}/{len(strict)} failures ({strict_failures / len(strict):.3%}); its selection distribution differs from Graph 1, so this is not a matched causal comparison.")
         else:
             lines.append("3. Strict mutual-support comparison has no feasible audited sets at tau=0.7, delta=0.0.")
-        eligible = [row for row in conflict_rows if int(row["anchor_count"]) >= 2 and float(row["pair_threshold"]) == 0.7]
-        anchor_failures = sum(bool(row["anchor_conflict"]) for row in eligible)
-        lines.append(f"4. At tau=0.7, {anchor_failures}/{len(eligible)} states with at least two anchors had an anchor-pair conflict (counted separately from the primary cohort).")
+        primary_anchor_rows = [
+            row for row in conflict_rows
+            if int(row["anchor_count"]) >= 2 and row["graph"] == "stability_only"
+            and float(row["pair_threshold"]) == 0.7 and float(row["lift_delta"]) == 0.0
+        ]
+        primary_anchor_failures = sum(bool(row["anchor_conflict"]) for row in primary_anchor_rows)
+        strict_anchor_rows = [
+            row for row in conflict_rows
+            if int(row["anchor_count"]) >= 2 and row["graph"] == "strict_mutual_support"
+            and float(row["pair_threshold"]) == 0.7 and float(row["lift_delta"]) == 0.0
+        ]
+        strict_anchor_failures = sum(bool(row["anchor_conflict"]) for row in strict_anchor_rows)
+        lines.append(
+            f"4. At tau=0.7, the primary stability-only graph had {primary_anchor_failures}/{len(primary_anchor_rows)} "
+            f"anchor-conflict states; strict mutual support at delta=0.0 had {strict_anchor_failures}/{len(strict_anchor_rows)}. "
+            "Other lift deltas are reported separately in anchor_conflict_rates.csv."
+        )
         lines.append("5. These results measure conditional self-consistency only. Even observed hard failures do not by themselves justify a practical referee; that needs sufficient incidence at operational thresholds and real set sizes. Conversely, zero failures do not establish pair-only sufficiency beyond the reported confidence bounds.")
     else:
         lines.extend([
