@@ -39,6 +39,9 @@ hard_set:
   attempts_per_set: 100
   smoke_state_limit: 2
   smoke_sets_per_size: 5
-  singleton_match_tolerance: 1.0e-4
+  # BF16 scalar probabilities agree very tightly; taking a logarithm to form a
+  # directed lift can amplify small probability rounding differences.
+  singleton_q2_match_tolerance: 1.0e-4
+  singleton_lift_match_tolerance: 1.0e-2
   max_runtime_seconds: 1800
   epsilon: 1.0e-12

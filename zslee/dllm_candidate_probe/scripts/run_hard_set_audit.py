@@ -217,12 +217,10 @@ def singleton_metrics_for_state(
                 "a_to_b_lift_abs_difference": abs(calculated.a_to_b_lift - prior_oriented.a_to_b_lift),
                 "b_to_a_lift_abs_difference": abs(calculated.b_to_a_lift - prior_oriented.b_to_a_lift),
             })
-            # Reuse the existing pair scalar summary only when it agrees with a
-            # fresh no-cache singleton recomputation; residuals cannot be rebuilt
-            # from the scalar cache and are provenance-labelled pilot values.
-            metrics[key] = PairMetric(
-                a, b, prior_oriented.q2, prior_oriented.a_to_b_lift, prior_oriented.b_to_a_lift, prior_oriented.residual_mean_tv
-            )
+            # Graph construction always uses the freshly measured values. The
+            # pilot residual is optional stress-mining provenance only; it cannot
+            # be reconstructed without persisting a full vocabulary tensor.
+            metrics[key] = calculated
         else:
             metrics[key] = calculated
     return metrics, comparisons
@@ -648,10 +646,13 @@ def main() -> None:
         )
         metrics_by_state[state_id(state)] = metrics
         comparisons.extend(state_comparisons)
-    tolerance = float(config["hard_set"]["singleton_match_tolerance"])
+    q2_tolerance = float(config["hard_set"]["singleton_q2_match_tolerance"])
+    lift_tolerance = float(config["hard_set"]["singleton_lift_match_tolerance"])
     bad_comparisons = [
         row for row in comparisons
-        if max(row["q2_abs_difference"], row["a_to_b_lift_abs_difference"], row["b_to_a_lift_abs_difference"]) > tolerance
+        if row["q2_abs_difference"] > q2_tolerance
+        or row["a_to_b_lift_abs_difference"] > lift_tolerance
+        or row["b_to_a_lift_abs_difference"] > lift_tolerance
     ]
     write_jsonl(output_root / "raw" / f"{args.mode}_singleton_reuse_comparison.jsonl", comparisons)
     plans, conflict_rows = plan_sets(states, candidates_by_state, metrics_by_state, config, args.mode)
@@ -686,6 +687,11 @@ def main() -> None:
         "scalar_cache_entries": len(cache.entries), "states_examined": len(states), "planned_sets": len(plans),
         "audited_sets": len(audit_rows), "singleton_reuse_pairs_compared": len(comparisons),
         "singleton_reuse_pairs_outside_tolerance": len(bad_comparisons), "git_commit": git_commit(args.probe_root),
+        "singleton_q2_match_tolerance": q2_tolerance, "singleton_lift_match_tolerance": lift_tolerance,
+        "max_reuse_q2_abs_difference": max((row["q2_abs_difference"] for row in comparisons), default=0.0),
+        "max_reuse_lift_abs_difference": max(
+            (max(row["a_to_b_lift_abs_difference"], row["b_to_a_lift_abs_difference"]) for row in comparisons), default=0.0
+        ),
         "cache_policy": "Each cache key covers full IDs, mask positions, insertions, model revision, dtype, target, and use_cache=False.",
     }
     write_reports(

@@ -53,8 +53,9 @@ bash scripts/run_hard_set_audit.sh
 The smoke run validates two stored states, attempts five sets for each target
 size (3, 4, 6, 8), checks all generated sets are cliques with unique positions,
 and compares reusable pilot pair quantities to newly measured no-cache
-singleton scalars (tolerance `1e-4`). It writes a timestamped log under
-`logs/` and results under `outputs/hard_set/`.
+singleton scalars (Q2 absolute tolerance `1e-4`, directed-lift absolute
+tolerance `1e-2` to account for BF16 log amplification). It writes a
+timestamped log under `logs/` and results under `outputs/hard_set/`.
 
 The audit examines two definitions of a hard set: stability-only pair cliques
 at `q2 >= tau`, and strict cliques which additionally require both directed
