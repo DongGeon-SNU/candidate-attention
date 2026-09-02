@@ -159,9 +159,18 @@ def _candidate_from_pair(item: Mapping[str, Any], record: Mapping[str, Any], kin
     )
 
 
-def pilot_pair_metrics(states: Iterable[Mapping[str, Any]], pair_rows: Iterable[Mapping[str, Any]]) -> dict[tuple[str, str], PairMetric]:
+def pilot_pair_metrics(
+    states: Iterable[Mapping[str, Any]], pair_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, dict[tuple[str, str], PairMetric]]:
+    """Index reusable pair records by full decoding-state identity first.
+
+    Position/token node IDs recur across prompts and decoding steps.  Keeping a
+    single global pair map would silently attach a valid pair measurement from
+    one state to another state with the same local node IDs.
+    """
+
     by_coordinate = {(int(row["prompt_index"]), int(row["step"])): row for row in states}
-    metrics: dict[tuple[str, str], PairMetric] = {}
+    metrics_by_state: dict[str, dict[tuple[str, str], PairMetric]] = {}
     for row in pair_rows:
         state = by_coordinate.get((int(row["prompt_index"]), int(row["step"])))
         if state is None:
@@ -173,9 +182,10 @@ def pilot_pair_metrics(states: Iterable[Mapping[str, Any]], pair_rows: Iterable[
             float(row["b_to_a_lift"]), float(row["residual_mean_tv"]) if row.get("residual_mean_tv") is not None else None,
         )
         key = pair_key(a, b)
-        if key not in metrics:
-            metrics[key] = metric
-    return metrics
+        state_metrics = metrics_by_state.setdefault(state_id(state), {})
+        if key not in state_metrics:
+            state_metrics[key] = metric
+    return metrics_by_state
 
 
 def scalar_cache_key(

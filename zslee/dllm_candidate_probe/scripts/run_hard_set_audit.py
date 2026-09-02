@@ -636,7 +636,7 @@ def main() -> None:
     evaluator = ExactEvaluator(
         model, dtype, model_revision, str(config["hard_set"]["exact_scalar_cache_schema"]), cache, mask_id,
     )
-    existing = pilot_pair_metrics(states, pairs)
+    existing_by_state = pilot_pair_metrics(states, pairs)
     candidates_by_state: dict[str, tuple[list[AuditCandidate], list[AuditCandidate]]] = {}
     metrics_by_state: dict[str, dict[tuple[str, str], PairMetric]] = {}
     comparisons: list[dict[str, Any]] = []
@@ -649,7 +649,8 @@ def main() -> None:
         all_candidates = anchors + unstable
         candidates_by_state[state_id(state)] = (anchors, unstable)
         metrics, state_comparisons = singleton_metrics_for_state(
-            state, all_candidates, evaluator, existing, epsilon=float(config["hard_set"]["epsilon"])
+            state, all_candidates, evaluator, existing_by_state.get(state_id(state), {}),
+            epsilon=float(config["hard_set"]["epsilon"])
         )
         metrics_by_state[state_id(state)] = metrics
         comparisons.extend(state_comparisons)

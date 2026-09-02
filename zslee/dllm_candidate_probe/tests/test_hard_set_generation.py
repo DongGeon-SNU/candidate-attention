@@ -22,7 +22,7 @@ from src.hard_set_generation import (
     set_signature,
     stress_mined_sets,
 )
-from src.set_audit import ExactScalarCache, provenance_validation, scalar_cache_key, state_id, validate_pilot_artifacts
+from src.set_audit import ExactScalarCache, pilot_pair_metrics, provenance_validation, scalar_cache_key, state_id, validate_pilot_artifacts
 
 
 def candidate(position: int, token_id: int, kind: str = "unstable") -> AuditCandidate:
@@ -149,6 +149,25 @@ class HardSetGenerationTest(unittest.TestCase):
             provenance = provenance_validation(root, reuse)
             self.assertTrue(provenance["fast_dllm_pin_match"])
             self.assertTrue(provenance["pilot_source_commit_match"])
+
+    def test_reused_pairs_are_scoped_to_full_state_not_local_node_ids(self) -> None:
+        def state(prompt_index: int, token_sequence: list[int]) -> dict[str, object]:
+            return {
+                "prompt_index": prompt_index, "step": 0, "token_sequence": token_sequence, "mask_positions": [1, 2],
+                "position_summaries": {
+                    "1": {"top1_confidence": 0.4}, "2": {"top1_confidence": 0.4},
+                },
+            }
+        first, second = state(0, [1, 99, 99]), state(1, [2, 99, 99])
+        def pair(prompt_index: int, q2: float) -> dict[str, object]:
+            return {
+                "prompt_index": prompt_index, "step": 0, "a": {"position": 1, "token_id": 10}, "b": {"position": 2, "token_id": 11},
+                "pair_stability_q2": q2, "a_to_b_lift": 0.1, "b_to_a_lift": 0.2,
+            }
+        indexed = pilot_pair_metrics([first, second], [pair(0, 0.55), pair(1, 0.95)])
+        self.assertEqual(len(indexed), 2)
+        self.assertEqual(next(iter(indexed[state_id(first)].values())).q2, 0.55)
+        self.assertEqual(next(iter(indexed[state_id(second)].values())).q2, 0.95)
 
 
 if __name__ == "__main__":
