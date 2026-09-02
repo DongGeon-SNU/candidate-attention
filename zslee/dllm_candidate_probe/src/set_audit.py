@@ -180,7 +180,7 @@ def pilot_pair_metrics(states: Iterable[Mapping[str, Any]], pair_rows: Iterable[
 
 def scalar_cache_key(
     *, input_token_ids: list[int], mask_positions: list[int], insertions: Iterable[AuditCandidate],
-    target: AuditCandidate, model_revision: str, dtype: str,
+    target: AuditCandidate, model_revision: str, dtype: str, cache_schema: str = "hard-set-v1",
 ) -> str:
     descriptor = {
         "input_token_ids": [int(item) for item in input_token_ids],
@@ -189,6 +189,7 @@ def scalar_cache_key(
         "target": (int(target.position), int(target.token_id)),
         "model_revision": model_revision,
         "dtype": dtype,
+        "cache_schema": cache_schema,
         "use_cache": False,
     }
     return hashlib.sha256(json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()

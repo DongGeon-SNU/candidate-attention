@@ -134,12 +134,15 @@ def audit_record_base(
 class ExactEvaluator:
     """Runs each missing scalar descriptor once and saves it immediately."""
 
-    def __init__(self, model: Any, dtype: Any, model_revision: str, cache: ExactScalarCache, mask_id: int) -> None:
+    def __init__(
+        self, model: Any, dtype: Any, model_revision: str, cache_schema: str, cache: ExactScalarCache, mask_id: int,
+    ) -> None:
         import torch
 
         self.model = model
         self.dtype = str(dtype)
         self.model_revision = model_revision
+        self.cache_schema = cache_schema
         self.cache = cache
         self.mask_id = mask_id
         self.torch = torch
@@ -156,7 +159,7 @@ class ExactEvaluator:
         keys = {
             target.node_id: scalar_cache_key(
                 input_token_ids=ids, mask_positions=masks, insertions=insertions, target=target,
-                model_revision=self.model_revision, dtype=self.dtype,
+                model_revision=self.model_revision, dtype=self.dtype, cache_schema=self.cache_schema,
             )
             for target in targets
         }
@@ -181,6 +184,7 @@ class ExactEvaluator:
                     {
                         "state_id": state_id(state), "target_position": target.position, "target_token_id": target.token_id,
                         "insertion_count": len(insertions), "model_revision": self.model_revision, "dtype": self.dtype,
+                        "cache_schema": self.cache_schema,
                     },
                 )
                 output[target.node_id] = probability
@@ -628,7 +632,10 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     cache = ExactScalarCache(output_root / "raw" / "exact_scalar_cache.jsonl")
-    evaluator = ExactEvaluator(model, dtype, str(config["model"]["hf_revision"]), cache, mask_id)
+    model_revision = f"{config['model']['hf_revision']}|fast-dllm:{config['model']['fast_dllm_commit']}"
+    evaluator = ExactEvaluator(
+        model, dtype, model_revision, str(config["hard_set"]["exact_scalar_cache_schema"]), cache, mask_id,
+    )
     existing = pilot_pair_metrics(states, pairs)
     candidates_by_state: dict[str, tuple[list[AuditCandidate], list[AuditCandidate]]] = {}
     metrics_by_state: dict[str, dict[tuple[str, str], PairMetric]] = {}
@@ -692,7 +699,7 @@ def main() -> None:
         "max_reuse_lift_abs_difference": max(
             (max(row["a_to_b_lift_abs_difference"], row["b_to_a_lift_abs_difference"]) for row in comparisons), default=0.0
         ),
-        "cache_policy": "Each cache key covers full IDs, mask positions, insertions, model revision, dtype, target, and use_cache=False.",
+        "cache_policy": "Each cache key covers full IDs, mask positions, insertions, model revision, dtype, cache schema, target, and use_cache=False.",
     }
     write_reports(
         args.probe_root, args.mode, audit_rows, conflict_rows, loo_rows, plans, state_by_id, metrics_by_state,

@@ -106,6 +106,13 @@ class HardSetGenerationTest(unittest.TestCase):
             model_revision="revision-b", dtype="torch.bfloat16",
         )
         self.assertNotEqual(first, second)
+        self.assertNotEqual(
+            first,
+            scalar_cache_key(
+                input_token_ids=[1, 9, 9], mask_positions=[1, 2], insertions=[self.anchors[0]], target=target,
+                model_revision="main", dtype="torch.bfloat16", cache_schema="hard-set-v2",
+            ),
+        )
         record = {"prompt_index": 0, "step": 1, "token_sequence": [1, 9], "mask_positions": [1]}
         changed = {**record, "token_sequence": [1, 8]}
         self.assertNotEqual(state_id(record), state_id(changed))
