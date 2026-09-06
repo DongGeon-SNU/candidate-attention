@@ -82,6 +82,10 @@ dtype, and `use_cache=False`.
 
 ## H100 top-1 dynamics audit
 
+The server handoff, including the H100 decision record, first-checkout steps,
+verified 16-mask/16-step scope, and review artifacts, is in
+[`H100_TOP1_DYNAMICS_AUDIT_HANDOFF.md`](H100_TOP1_DYNAMICS_AUDIT_HANDOFF.md).
+
 This is a separate, frozen-model audit of whether the current top-1 token at a
 masked position changes across the natural dLLM trajectory. It first records a
 natural trajectory using the existing threshold-plus-fallback collector, then
