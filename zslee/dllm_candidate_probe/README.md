@@ -80,6 +80,58 @@ do not bypass the guard. The scalar cache at
 entry on full input IDs, mask positions, insertion set, target, model revision,
 dtype, and `use_cache=False`.
 
+## H100 top-1 dynamics audit
+
+This is a separate, frozen-model audit of whether the current top-1 token at a
+masked position changes across the natural dLLM trajectory. It first records a
+natural trajectory using the existing threshold-plus-fallback collector, then
+replays every reported state and every causal branch from complete input IDs
+with `use_cache=False`. It does not train a predictor, alter decoding, or save
+full vocabulary distributions.
+
+Run it from the persistent H100 project location after `scripts/setup.sh`:
+
+```bash
+export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
+cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
+# Required only if the scheduler has not already set it and this job can see
+# multiple physical GPUs. Use the H100 assigned by the scheduler; PyTorch
+# logical cuda:0 will then be that device.
+# export CUDA_VISIBLE_DEVICES=<assigned-H100-index>
+
+# Optional but recommended: one prompt per public benchmark and exact replay.
+bash scripts/run_top1_dynamics_smoke.sh
+
+# Resource-gated primary run plus threshold sensitivity and, when budget permits,
+# exact anchor counterfactuals and order replays.
+bash scripts/run_top1_dynamics_audit.sh
+```
+
+The audit wrapper opts into downloading the declared public benchmark datasets
+and writes a timestamped run below `outputs/top1_dynamics_audit/`, plus a
+timestamped log under `logs/`. Its default `auto` mode always performs its own
+small smoke collection, then stops safely if the measured projection exceeds
+the configured 80 GiB peak-VRAM, four-hour, or 50 GiB additional-disk limits.
+The projection includes a smoke-calibrated estimate for the mandated 10,000
+prompt-clustered bootstrap analysis, not only GPU forwards. It also refuses to
+run if the checked-out Fast-dLLM commit or the historical raw-logit
+threshold/fallback collector semantics do not match the declared audit.
+Use `TOP1_DYNAMICS_MODE=observational bash scripts/run_top1_dynamics_audit.sh`
+to omit anchor counterfactuals and order replays; use `TOP1_DYNAMICS_MODE=all`
+to request them, still subject to the same resource gate. Do not add
+`--skip-resource-gate` to unattended jobs.
+
+Each completed run contains `run_manifest.json`, `resource_estimate.json`,
+`handoff.md`, raw scalar/Parquet evidence, CSV tables, figures, and
+representative cases. A resource-gated run still preserves its smoke evidence
+and manifest for diagnosis.
+
+The pinned, verified collector currently uses a 16-mask / 16-step compatible
+trajectory. The config records the requested 512-token / 64-block target only
+as metadata because no corresponding block-decoding behavior has yet been
+verified in the pinned Fast-dLLM source; same-block results are therefore
+reported as unavailable rather than inferred from an artificial partition.
+
 ## Output policy
 
 Only scalar statistics, IDs, and top-k probabilities are written. Full-vocabulary distributions are reduced on GPU and never saved; attention maps, hidden states, and KV tensors are never stored. Runtime outputs, virtual environments, caches, and vendor source are ignored by Git. `outputs/summary.md` is generated after smoke/pilot and records the model, dtype, source pin, seed, metrics, and result paths.

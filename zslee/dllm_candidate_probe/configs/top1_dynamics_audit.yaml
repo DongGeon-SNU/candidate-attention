@@ -1,0 +1,108 @@
+# Frozen dLLM top-1 dynamics audit. These settings retain the existing pilot's
+# decoder semantics; no learned selector, quantization, or policy intervention.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  seed: 20260902
+  threshold: 0.9
+  # Preserved from the candidate-interaction pilot.  The new audit reports
+  # this subset separately; it never uses it to define the primary denominator.
+  tau_mass: 0.8
+  temperature: 0.0
+  # The pinned pilot performs an identity/raw-logit FP32 softmax despite its
+  # temperature field.  Do not silently invent a temperature or special-token
+  # filter until the pinned Fast-dLLM decoder is verified to use one.
+  logit_processing: identity_raw_logits_matches_existing_collector
+  special_token_filtering: none_in_existing_collector
+  confidence_rule: softmax_processed_logits_fp32_top1
+  fallback_rule: force_highest_confidence_position_when_none_reach_threshold
+  tie_policy: existing_torch_topk_for_policy__shared_best_rank_for_reported_rank
+  # The existing collector has no verified Fast-dLLM block-size setting. Keep
+  # its compatible 16-mask trajectory and record the 512/64 request as metadata.
+  generation_length: 16
+  steps: 16
+  requested_max_generation_length: 512
+  requested_block_size: 64
+  # No block-size implementation has been verified in the pinned source yet.
+  # `null` means same-block stratification is marked unavailable rather than
+  # pretending that an arbitrary 64-token partition is decoder behavior.
+  analysis_block_size: null
+  use_cache_for_state_collection: true
+  low_parallel_max_transferred: 2
+  low_parallel_remaining_fraction: 0.10
+  top_k: 10
+  epsilon: 1.0e-12
+
+datasets:
+  - name: gsm8k
+    hf_path: openai/gsm8k
+    hf_config: main
+    split: test
+    primary_prompt_limit: 200
+    sensitivity_prompt_limit: 50
+    task_type: math_reasoning
+  - name: humaneval
+    hf_path: openai_humaneval
+    hf_config: null
+    split: test
+    primary_prompt_limit: all
+    sensitivity_prompt_limit: 50
+    task_type: code_generation
+  - name: ifeval
+    hf_path: google/IFEval
+    hf_config: null
+    split: train
+    primary_prompt_limit: 200
+    sensitivity_prompt_limit: 50
+    task_type: instruction_reasoning
+
+sampling:
+  smoke_prompts_per_dataset: 1
+  thresholds:
+    primary: 0.9
+    sensitivity: [0.8, 0.95]
+  event_target_per_cohort: 300
+  max_counterfactual_events: 600
+  max_order_states_per_anchor_size: 12
+  max_order_permutations: 32
+  clustered_bootstrap_replicates: 10000
+  bootstrap_seed: 20260902
+  phase_boundaries: [0.3333333333, 0.6666666667]
+  confidence_bins: [0.0, 0.5, 0.7, 0.85, 0.95, 1.0000001]
+  metric_quantile_bins: 10
+  order_anchor_sizes: [2, 3, 4, 6, 8]
+  # 600 is the total cap: up to 300 flips and up to 300 matched non-flips.
+  matched_control_target: 300
+
+execution:
+  output_schema_version: 1
+  allow_remote_public_datasets_by_default: false
+  natural_collection_cache_policy: use_cache_true_without_past_key_values_reuse
+  exact_measurement_cache_policy: use_cache_false
+  source_decoder_semantics_verification: required_before_primary_interpretation
+  random_seed_namespace: top1-dynamics-audit-v1
+
+resource_policy:
+  max_peak_vram_mib: 81920
+  max_runtime_seconds: 14400
+  max_additional_disk_gib: 50
+  # The primary stage refuses automatic exact/order work above this bound.
+  counterfactual_runtime_fraction: 0.45
+  # Calibrate the CPU reporting stage on the smoke rows, then conservatively
+  # extrapolate its required 10,000 prompt-clustered bootstrap draws.  This
+  # prevents GPU-only forward estimates from approving a run that cannot
+  # finish its mandated tables/CI calculations within the four-hour budget.
+  analysis_calibration_bootstrap_replicates: 20
+  analysis_runtime_safety_factor: 2.0
+  analysis_fixed_overhead_seconds: 120
+
+storage:
+  output_root: outputs/top1_dynamics_audit
+  prefer_parquet: true
+  save_top_k: 10
+  save_full_distributions: false
