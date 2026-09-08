@@ -1160,7 +1160,9 @@ def write_figures(
 
     granular: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
     for row in polarity_rows:
-        if row.get("row_type") != "pair_summary" and row.get("candidate_set_mode") == "fixed_k4":
+        # Raw assignment rows have no row_type.  Both pair summaries and
+        # undirected direction summaries deliberately omit source_position.
+        if not row.get("row_type") and row.get("candidate_set_mode") == "fixed_k4":
             granular[(row["state_key"], row["candidate_set_mode"], row["source_position"], row["target_position"])].append(row)
     # Fixed deterministic hash order is the predeclared representative-case
     # rule: matrices are not selected on their apparent polarity strength.
