@@ -1016,7 +1016,15 @@ def write_report(
     existential_loo = _summary_value(summaries, category="EXISTENTIAL_PLUS_LOO")
     existential_loo_rate = float((existential_loo or {}).get("micro_rate") or 0.0)
     gain = existential_loo_rate - all_rate
-    if gain >= 0.05 and exists_loo_total and exists_loo_pass_count / exists_loo_total >= 0.5:
+    # A near-universal U certificate with only a small E+LOO increment is
+    # evidence *for retaining U*, not a policy NO-GO.  The previous ordering
+    # let the arbitrary "material E gain" heuristic override that evidence.
+    if all_rate >= 0.90 and gain < 0.05:
+        primary_decision = (
+            "GO: retain universal all-order current-top1 VCCC as the primary oracle; "
+            "the observed existential+LOO increment is too small to justify a policy switch."
+        )
+    elif gain >= 0.05 and exists_loo_total and exists_loo_pass_count / exists_loo_total >= 0.5:
         primary_decision = "BRANCH: prioritise existential/partial-order certificate with mandatory final-LOO validation."
     elif all_rate > 0.0 and (not exists_loo_total or exists_loo_pass_count / exists_loo_total < 0.5):
         primary_decision = "GO: retain universal all-order current-top1 VCCC as the primary safe certificate."
