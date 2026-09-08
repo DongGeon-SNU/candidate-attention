@@ -15,7 +15,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 if "yaml" not in sys.modules and importlib.util.find_spec("yaml") is None:
     sys.modules.setdefault("yaml", types.SimpleNamespace(safe_load=lambda value: {}))
 
-from scripts.run_vccc_oracle_audit import SelectedState, certificate_rows_for_state, state_candidates  # noqa: E402
+from scripts.run_vccc_oracle_audit import (  # noqa: E402
+    ForwardAccounting,
+    SelectedState,
+    certificate_rows_for_state,
+    state_candidates,
+)
 
 
 def _config() -> dict[str, object]:
@@ -31,6 +36,10 @@ def _config() -> dict[str, object]:
 
 
 class VCCCOracleRunnerHelpersTest(unittest.TestCase):
+    def test_forward_accounting_uses_the_declared_started_field(self) -> None:
+        accounting = ForwardAccounting(started=1.25)
+        self.assertEqual(accounting.started, 1.25)
+
     def _record(self) -> dict[str, object]:
         return {
             "state_key": "state",

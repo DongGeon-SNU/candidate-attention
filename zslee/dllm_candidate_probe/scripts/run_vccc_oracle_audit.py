@@ -1299,7 +1299,7 @@ def main() -> None:
     mask_id = mask_token_id(model, tokenizer)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    accounting = ForwardAccounting(start=time.perf_counter())
+    accounting = ForwardAccounting(started=time.perf_counter())
     all_state_rows: list[dict[str, Any]] = []
     all_witness_rows: list[dict[str, Any]] = []
     all_final_loo: list[dict[str, Any]] = []
