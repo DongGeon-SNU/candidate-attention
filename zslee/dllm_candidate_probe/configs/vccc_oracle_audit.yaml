@@ -1,0 +1,46 @@
+# Frozen exact oracle audit.  This reads a completed top1_dynamics_audit raw
+# bundle and creates a *new* outputs/vccc_oracle_audit/<timestamp> directory.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  # Retained as explicit provenance for the pinned loader; no new trajectory
+  # is sampled by this oracle runner.
+  seed: 20260902
+  threshold: 0.9
+  tau_mass: 0.8
+
+sampling:
+  primary_threshold: 0.9
+  set_sizes: [2, 3, 4, 6, 8]
+  # 125 policy states nominally spans at least 100 prompts when the source
+  # state availability allows it.  Hard states are never pooled into primary.
+  primary_states_per_size: 25
+  hard_states_per_size: 12
+  margin_thresholds: [0.0, 0.25, 0.5, 1.0]
+  local_topk_values: [1, 2, 3, 4, 5, 8, 10, 16]
+  # Fixed, predeclared bins retain zero-count rows in the high-confidence table.
+  p1_minus_p2_bin_edges: [0.01, 0.05, 0.10, 0.20, 1.0]
+  logit_margin_bin_edges: [0.0, 0.25, 0.5, 1.0, 2.0, 4.0]
+
+certificate:
+  # Full-vocabulary logit margin; tolerance only controls numerical equality.
+  tie_tolerance: 1.0e-7
+
+candidate_polarity:
+  representative_pair_count: 10
+  adaptive_mass: 0.80
+  adaptive_k_max: 8
+
+execution:
+  subset_batch_size: 8
+  polarity_batch_size: 8
+  exact_measurement_cache_policy: use_cache_false
+  random_seed_namespace: vccc-oracle-audit-v1
+
+storage:
+  output_root: outputs/vccc_oracle_audit

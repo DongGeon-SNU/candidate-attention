@@ -145,6 +145,44 @@ as metadata because no corresponding block-decoding behavior has yet been
 verified in the pinned Fast-dLLM source; same-block results are therefore
 reported as unavailable rather than inferred from an artificial partition.
 
+## VCCC universal/existential oracle audit
+
+This is a third, read-only continuation of a **completed** top-1 dynamics
+run. It does not resample prompts, retrain a selector, alter the frozen model,
+or overwrite the source run. It reads `raw/trajectories.jsonl`, retains only
+policy-selected anchors whose recorded token is also the exact current top-1,
+and remeasures every counterfactual subset with `use_cache=False`.
+
+The Universal (U) result fixes current top-1 assignments and requires every
+subset/order to preserve them. The Existential (E) result uses subset DP to
+find one safe witness order. `E + final LOO` is a separate reported rate; an
+E-only state is never presented as safe parallelism. Candidate-value polarity
+is exploratory and is not pooled with U/E prevalence.
+
+After the H100 full audit has completed, run the oracle in a fresh shell:
+
+```bash
+export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
+cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
+
+# This path is read-only and is never overwritten.
+bash scripts/run_vccc_oracle_audit.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z
+```
+
+The runner creates a new timestamped directory under
+`outputs/vccc_oracle_audit/`. It stores `summary.json`, `report.md`,
+configuration/provenance, all A--E tables, and ten deterministically selected
+K=4 polarity matrices when enough valid policy pairs exist. The matrix
+selection rule is a stable hash of state and position pair, not apparent
+effect magnitude. Before the final run, append `--smoke`; its output is
+labelled `completed_smoke` and must not be used as the primary conclusion.
+
+The wrapper refuses a GPU with existing compute processes and never stops or
+modifies another process. If `nvidia-smi` shows the only process is this job,
+explicitly acknowledge that fact with `VCCC_ORACLE_ALLOW_BUSY_GPU=1` for that
+invocation.
+
 ## Output policy
 
 Only scalar statistics, IDs, and top-k probabilities are written. Full-vocabulary distributions are reduced on GPU and never saved; attention maps, hidden states, and KV tensors are never stored. Runtime outputs, virtual environments, caches, and vendor source are ignored by Git. `outputs/summary.md` is generated after smoke/pilot and records the model, dtype, source pin, seed, metrics, and result paths.
