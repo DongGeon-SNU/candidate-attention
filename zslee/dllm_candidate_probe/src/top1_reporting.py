@@ -218,6 +218,67 @@ def _validate_confidence(confidence: float) -> None:
         raise ValueError("confidence must be strictly between 0 and 1.")
 
 
+def _cuda_bootstrap_cluster_means(
+    means: Sequence[float],
+    sums: Sequence[float],
+    counts: Sequence[int],
+    *,
+    iterations: int,
+    seed: int,
+    weighting: Weighting,
+    batch_size: int = 512,
+) -> list[float] | None:
+    """Draw clustered means in batches on the visible CUDA device when present.
+
+    This is an optional accelerator, not a different resampling scheme: each
+    row still draws exactly ``n_clusters`` prompt IDs with replacement.  The
+    CPU implementation remains the portability fallback for unit tests and
+    CPU-only post-processing.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    device = torch.device("cuda")
+    cluster_count = len(means)
+    if not cluster_count:
+        return []
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    mean_tensor = torch.tensor(means, dtype=torch.float64, device=device)
+    sum_tensor = torch.tensor(sums, dtype=torch.float64, device=device)
+    count_tensor = torch.tensor(counts, dtype=torch.float64, device=device)
+    draws: list[float] = []
+
+    for offset in range(0, iterations, batch_size):
+        draw_count = min(batch_size, iterations - offset)
+        sampled = torch.randint(
+            0,
+            cluster_count,
+            (draw_count, cluster_count),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        row_offsets = torch.arange(draw_count, device=device, dtype=torch.int64).unsqueeze(1) * cluster_count
+        multiplicities = torch.bincount(
+            (sampled + row_offsets).reshape(-1),
+            minlength=draw_count * cluster_count,
+        ).reshape(draw_count, cluster_count).to(dtype=torch.float64)
+        if weighting == "macro":
+            values = multiplicities.matmul(mean_tensor) / cluster_count
+        else:
+            values = multiplicities.matmul(sum_tensor) / multiplicities.matmul(count_tensor)
+        # ``tolist`` is also the synchronization point used by the timing
+        # calibration; it prevents falsely optimistic asynchronous estimates.
+        draws.extend(float(value) for value in values.detach().cpu().tolist())
+    return draws
+
+
 def _bootstrap_from_clusters(
     cluster_values: Mapping[Hashable, Sequence[float]],
     *,
@@ -263,16 +324,26 @@ def _bootstrap_from_clusters(
     else:
         estimate = math.fsum(sums) / math.fsum(counts)
 
-    generator = random.Random(seed)
     n_clusters = len(cleaned)
-    draws: list[float] = []
-    for _ in range(iterations):
-        selected = [generator.randrange(n_clusters) for _ in range(n_clusters)]
-        if weighting == "macro":
-            draws.append(math.fsum(means[index] for index in selected) / n_clusters)
-        else:
-            denominator = math.fsum(counts[index] for index in selected)
-            draws.append(math.fsum(sums[index] for index in selected) / denominator)
+    draws = _cuda_bootstrap_cluster_means(
+        means,
+        sums,
+        counts,
+        iterations=iterations,
+        seed=seed,
+        weighting=weighting,
+    )
+    backend = "torch_cuda" if draws is not None else "python"
+    if draws is None:
+        generator = random.Random(seed)
+        draws = []
+        for _ in range(iterations):
+            selected = [generator.randrange(n_clusters) for _ in range(n_clusters)]
+            if weighting == "macro":
+                draws.append(math.fsum(means[index] for index in selected) / n_clusters)
+            else:
+                denominator = math.fsum(counts[index] for index in selected)
+                draws.append(math.fsum(sums[index] for index in selected) / denominator)
     draws.sort()
     alpha = (1.0 - confidence) / 2.0
     low = _percentile(draws, alpha)
@@ -289,6 +360,7 @@ def _bootstrap_from_clusters(
         "iterations": iterations,
         "confidence": confidence,
         "weighting": weighting,
+        "bootstrap_backend": backend,
     }
 
 
@@ -526,6 +598,115 @@ def _extract_binary_score_records(
     return selected, omitted
 
 
+def _cuda_prompt_clustered_ranking_draws(
+    selected: Sequence[Mapping[str, Any]],
+    *,
+    higher_is_positive: bool,
+    iterations: int,
+    seed: int,
+    batch_size: int = 512,
+) -> tuple[list[float], list[float]] | None:
+    """Return exact prompt-resample AUROC/AP draws using batched CUDA tensors.
+
+    A bootstrap draw assigns each prompt cluster a multiplicity.  The score
+    order and tie groups never change, so they are sorted once; only the prompt
+    multiplicities are drawn per replicate.  The formulas below are the
+    weighted versions of :func:`binary_ranking_metrics`: Mann--Whitney U with
+    half credit for ties and threshold-grouped average precision.  Therefore
+    this reduces wall time without replacing the declared 10,000-draw,
+    prompt-clustered uncertainty estimate.
+    """
+
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available() or not selected:
+        return None
+
+    prompts = sorted({row["prompt"] for row in selected}, key=_stable_key)
+    prompt_index = {prompt: index for index, prompt in enumerate(prompts)}
+    scores = [float(row["score"]) if higher_is_positive else -float(row["score"]) for row in selected]
+    order = sorted(range(len(selected)), key=lambda index: (scores[index], index))
+    sorted_scores = [scores[index] for index in order]
+    group_ids: list[int] = []
+    group = -1
+    prior: float | None = None
+    for score in sorted_scores:
+        if prior is None or score != prior:
+            group += 1
+            prior = score
+        group_ids.append(group)
+    group_count = group + 1
+    cluster_count = len(prompts)
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    cluster_ids = torch.tensor(
+        [prompt_index[selected[index]["prompt"]] for index in order],
+        dtype=torch.int64,
+        device=device,
+    )
+    labels = torch.tensor(
+        [1.0 if bool(selected[index]["outcome"]) else 0.0 for index in order],
+        dtype=torch.float64,
+        device=device,
+    )
+    group_tensor = torch.tensor(group_ids, dtype=torch.int64, device=device)
+    record_count = len(order)
+    group_index = group_tensor.unsqueeze(0)
+    auroc_draws: list[float] = []
+    auprc_draws: list[float] = []
+
+    for offset in range(0, iterations, batch_size):
+        draw_count = min(batch_size, iterations - offset)
+        sampled = torch.randint(
+            0,
+            cluster_count,
+            (draw_count, cluster_count),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        row_offsets = torch.arange(draw_count, device=device, dtype=torch.int64).unsqueeze(1) * cluster_count
+        cluster_weights = torch.bincount(
+            (sampled + row_offsets).reshape(-1),
+            minlength=draw_count * cluster_count,
+        ).reshape(draw_count, cluster_count).to(dtype=torch.float64)
+        record_weights = cluster_weights.index_select(1, cluster_ids)
+        positive_by_record = record_weights * labels
+        negative_by_record = record_weights - positive_by_record
+        expanded_groups = group_index.expand(draw_count, record_count)
+        positive_by_group = torch.zeros((draw_count, group_count), dtype=torch.float64, device=device).scatter_add(
+            1, expanded_groups, positive_by_record
+        )
+        negative_by_group = torch.zeros((draw_count, group_count), dtype=torch.float64, device=device).scatter_add(
+            1, expanded_groups, negative_by_record
+        )
+
+        positive_total = positive_by_group.sum(dim=1)
+        negative_total = negative_by_group.sum(dim=1)
+        auroc_valid = (positive_total > 0) & (negative_total > 0)
+        negatives_before = torch.cumsum(negative_by_group, dim=1) - negative_by_group
+        u_positive = (positive_by_group * (negatives_before + 0.5 * negative_by_group)).sum(dim=1)
+        auroc = u_positive / (positive_total * negative_total).clamp_min(1.0)
+        if bool(auroc_valid.any()):
+            auroc_draws.extend(float(value) for value in auroc[auroc_valid].detach().cpu().tolist())
+
+        positives_desc = torch.flip(positive_by_group, dims=(1,))
+        totals_desc = positives_desc + torch.flip(negative_by_group, dims=(1,))
+        cumulative_positive = torch.cumsum(positives_desc, dim=1)
+        cumulative_total = torch.cumsum(totals_desc, dim=1)
+        precision = cumulative_positive / cumulative_total.clamp_min(1.0)
+        average_precision = (positives_desc / positive_total.unsqueeze(1).clamp_min(1.0) * precision).sum(dim=1)
+        ap_valid = positive_total > 0
+        if bool(ap_valid.any()):
+            auprc_draws.extend(float(value) for value in average_precision[ap_valid].detach().cpu().tolist())
+
+    return auroc_draws, auprc_draws
+
+
 def prompt_clustered_ranking_bootstrap(
     records: Iterable[Mapping[str, Any] | Any],
     *,
@@ -577,23 +758,33 @@ def prompt_clustered_ranking_bootstrap(
             "omitted_record_count": omitted,
         }
 
-    generator = random.Random(seed)
-    auroc_draws: list[float] = []
-    auprc_draws: list[float] = []
     cluster_count = len(ordered_clusters)
-    for _ in range(iterations):
-        labels: list[bool] = []
-        scores: list[float] = []
-        for _cluster_draw in range(cluster_count):
-            cluster = ordered_clusters[generator.randrange(cluster_count)]
-            for label, score in cluster:
-                labels.append(label)
-                scores.append(score)
-        metric = binary_ranking_metrics(labels, scores, higher_is_positive=higher_is_positive)
-        if metric["auroc"] is not None:
-            auroc_draws.append(float(metric["auroc"]))
-        if metric["auprc"] is not None:
-            auprc_draws.append(float(metric["auprc"]))
+    accelerated = _cuda_prompt_clustered_ranking_draws(
+        selected,
+        higher_is_positive=higher_is_positive,
+        iterations=iterations,
+        seed=seed,
+    )
+    backend = "torch_cuda" if accelerated is not None else "python"
+    if accelerated is None:
+        generator = random.Random(seed)
+        auroc_draws = []
+        auprc_draws = []
+        for _ in range(iterations):
+            labels: list[bool] = []
+            scores: list[float] = []
+            for _cluster_draw in range(cluster_count):
+                cluster = ordered_clusters[generator.randrange(cluster_count)]
+                for label, score in cluster:
+                    labels.append(label)
+                    scores.append(score)
+            metric = binary_ranking_metrics(labels, scores, higher_is_positive=higher_is_positive)
+            if metric["auroc"] is not None:
+                auroc_draws.append(float(metric["auroc"]))
+            if metric["auprc"] is not None:
+                auprc_draws.append(float(metric["auprc"]))
+    else:
+        auroc_draws, auprc_draws = accelerated
     auroc_draws.sort()
     auprc_draws.sort()
     alpha = (1.0 - confidence) / 2.0
@@ -613,6 +804,7 @@ def prompt_clustered_ranking_bootstrap(
         "confidence": confidence,
         "cluster_count": cluster_count,
         "omitted_record_count": omitted,
+        "bootstrap_backend": backend,
     }
 
 

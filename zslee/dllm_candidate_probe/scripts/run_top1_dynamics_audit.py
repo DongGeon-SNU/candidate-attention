@@ -1430,9 +1430,39 @@ def calibrate_analysis_runtime(
             "analysis_runtime_seconds_estimate": float(policy["max_runtime_seconds"]) + 1.0,
             "note": "No smoke future-label rows were observable; automatic promotion is blocked because bootstrap throughput could not be measured.",
         }
+    smoke_prompt_count = max(len(smoke_bundle.prompt_rows), 1)
+    projected_rows = max(
+        1,
+        int(math.ceil(len(prediction_rows) / smoke_prompt_count * max(primary_example_count, 1))),
+    )
+    try:
+        import torch
+        cuda_bootstrap_available = bool(torch.cuda.is_available())
+    except ImportError:
+        cuda_bootstrap_available = False
+
+    # CUDA ranking bootstrap is batched, so a three-prompt smoke would mostly
+    # time launch overhead and catastrophically over-project the final run.
+    # Repeat only compact public smoke records to the planned row/cluster scale
+    # when the optional CUDA implementation is active.  The duplicated rows
+    # are used strictly for throughput measurement, never as study evidence.
+    calibration_rows = prediction_rows
+    calibration_row_count = len(prediction_rows)
+    if cuda_bootstrap_available and projected_rows > len(prediction_rows):
+        repeats = int(math.ceil(projected_rows / len(prediction_rows)))
+        calibration_rows = []
+        for replicate in range(repeats):
+            for row in prediction_rows:
+                if len(calibration_rows) >= projected_rows:
+                    break
+                copied = dict(row)
+                copied["prompt_id"] = f"calibration-{replicate}-{row['prompt_id']}"
+                calibration_rows.append(copied)
+        calibration_row_count = len(calibration_rows)
+
     started = time.perf_counter()
     predictiveness_table(
-        prediction_rows,
+        calibration_rows,
         score_fields=("entropy",),
         outcome_field="next_step_top1_flip",
         prompt_field="prompt_id",
@@ -1445,7 +1475,7 @@ def calibrate_analysis_runtime(
     rank_elapsed = time.perf_counter() - started
     started = time.perf_counter()
     quantile_bin_table(
-        prediction_rows,
+        calibration_rows,
         score_field="entropy",
         outcome_field="next_step_top1_flip",
         prompt_field="prompt_id",
@@ -1455,16 +1485,12 @@ def calibrate_analysis_runtime(
     )
     quantile_elapsed = time.perf_counter() - started
 
-    smoke_prompt_count = max(len(smoke_bundle.prompt_rows), 1)
-    projected_rows = max(
-        1,
-        int(math.ceil(len(prediction_rows) / smoke_prompt_count * max(primary_example_count, 1))),
-    )
-    # Ranking bootstrap work is approximately O(n log n) per draw.  Scaling
-    # by this deliberately upper-bounds simple per-row extrapolation.
+    # CPU ranking work is approximately O(n log n) per draw. CUDA calibration
+    # above already uses the planned row/cluster scale and must not multiply
+    # launch overhead by a synthetic row-work factor a second time.
     observed_work = len(prediction_rows) * math.log2(len(prediction_rows) + 1)
     projected_work = projected_rows * math.log2(projected_rows + 1)
-    row_work_scale = projected_work / max(observed_work, 1.0)
+    row_work_scale = 1.0 if cuda_bootstrap_available else projected_work / max(observed_work, 1.0)
     rank_jobs = len(PREDICTIVENESS_SCORE_FIELDS) * (
         len(PREDICTIVENESS_OUTCOMES) + 2
     )
@@ -1481,6 +1507,8 @@ def calibrate_analysis_runtime(
         "target_bootstrap_replicates": target_replicates,
         "smoke_prediction_record_count": len(prediction_rows),
         "projected_primary_prediction_record_count": projected_rows,
+        "calibration_prediction_record_count": calibration_row_count,
+        "bootstrap_accelerator": "torch_cuda" if cuda_bootstrap_available else "python",
         "row_work_scale": row_work_scale,
         "rank_bootstrap_seconds_per_smoke_draw": rank_elapsed / calibration_replicates,
         "quantile_bootstrap_seconds_per_smoke_draw": quantile_elapsed / calibration_replicates,

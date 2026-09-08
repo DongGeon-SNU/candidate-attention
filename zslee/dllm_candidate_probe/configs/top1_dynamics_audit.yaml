@@ -97,7 +97,9 @@ resource_policy:
   # extrapolate its required 10,000 prompt-clustered bootstrap draws.  This
   # prevents GPU-only forward estimates from approving a run that cannot
   # finish its mandated tables/CI calculations within the four-hour budget.
-  analysis_calibration_bootstrap_replicates: 20
+  # Match the CUDA bootstrap batch width so the smoke timing measures a
+  # representative saturated batch rather than launch overhead from 20 draws.
+  analysis_calibration_bootstrap_replicates: 512
   analysis_runtime_safety_factor: 2.0
   analysis_fixed_overhead_seconds: 120
 
