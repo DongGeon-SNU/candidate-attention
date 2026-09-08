@@ -1,0 +1,93 @@
+# Ten-minute, observational-only H100 preview. This is a diagnostic preview,
+# not a substitute for the pre-registered primary cohort or its interpretation.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  seed: 20260902
+  threshold: 0.9
+  tau_mass: 0.8
+  temperature: 0.0
+  logit_processing: identity_raw_logits_matches_existing_collector
+  special_token_filtering: none_in_existing_collector
+  confidence_rule: softmax_processed_logits_fp32_top1
+  fallback_rule: force_highest_confidence_position_when_none_reach_threshold
+  tie_policy: existing_torch_topk_for_policy__shared_best_rank_for_reported_rank
+  generation_length: 16
+  steps: 16
+  requested_max_generation_length: 512
+  requested_block_size: 64
+  analysis_block_size: null
+  use_cache_for_state_collection: true
+  low_parallel_max_transferred: 2
+  low_parallel_remaining_fraction: 0.10
+  top_k: 10
+  epsilon: 1.0e-12
+
+datasets:
+  - name: gsm8k
+    hf_path: openai/gsm8k
+    hf_config: main
+    split: test
+    primary_prompt_limit: 3
+    sensitivity_prompt_limit: 0
+    task_type: math_reasoning
+  - name: humaneval
+    hf_path: openai_humaneval
+    hf_config: null
+    split: test
+    primary_prompt_limit: 3
+    sensitivity_prompt_limit: 0
+    task_type: code_generation
+  - name: ifeval
+    hf_path: google/IFEval
+    hf_config: null
+    split: train
+    primary_prompt_limit: 3
+    sensitivity_prompt_limit: 0
+    task_type: instruction_reasoning
+
+sampling:
+  smoke_prompts_per_dataset: 1
+  thresholds:
+    primary: 0.9
+    sensitivity: [0.8, 0.95]
+  event_target_per_cohort: 0
+  max_counterfactual_events: 0
+  max_order_states_per_anchor_size: 0
+  max_order_permutations: 0
+  clustered_bootstrap_replicates: 10000
+  bootstrap_seed: 20260902
+  phase_boundaries: [0.3333333333, 0.6666666667]
+  confidence_bins: [0.0, 0.5, 0.7, 0.85, 0.95, 1.0000001]
+  metric_quantile_bins: 10
+  order_anchor_sizes: [2, 3, 4, 6, 8]
+  matched_control_target: 0
+
+execution:
+  output_schema_version: 1
+  allow_remote_public_datasets_by_default: false
+  natural_collection_cache_policy: use_cache_true_without_past_key_values_reuse
+  exact_measurement_cache_policy: use_cache_false
+  source_decoder_semantics_verification: required_before_primary_interpretation
+  random_seed_namespace: top1-dynamics-quicklook-v1
+
+resource_policy:
+  max_peak_vram_mib: 81920
+  # The preview stops rather than quietly becoming an extended experiment.
+  max_runtime_seconds: 600
+  max_additional_disk_gib: 5
+  counterfactual_runtime_fraction: 0.0
+  analysis_calibration_bootstrap_replicates: 512
+  analysis_runtime_safety_factor: 2.0
+  analysis_fixed_overhead_seconds: 60
+
+storage:
+  output_root: outputs/top1_dynamics_quicklook
+  prefer_parquet: true
+  save_top_k: 10
+  save_full_distributions: false

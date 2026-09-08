@@ -106,6 +106,10 @@ cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
 # Optional but recommended: one prompt per public benchmark and exact replay.
 bash scripts/run_top1_dynamics_smoke.sh
 
+# Bounded 9-prompt observational preview. It retains 10,000 clustered
+# bootstrap draws but has a hard ten-minute resource gate and separate output.
+bash scripts/run_top1_dynamics_quicklook.sh
+
 # Resource-gated primary run plus threshold sensitivity and, when budget permits,
 # exact anchor counterfactuals and order replays.
 bash scripts/run_top1_dynamics_audit.sh
@@ -124,6 +128,11 @@ Use `TOP1_DYNAMICS_MODE=observational bash scripts/run_top1_dynamics_audit.sh`
 to omit anchor counterfactuals and order replays; use `TOP1_DYNAMICS_MODE=all`
 to request them, still subject to the same resource gate. Do not add
 `--skip-resource-gate` to unattended jobs.
+
+The quicklook is deliberately observational-only and uses three prompts from
+each public benchmark. It is useful for checking that the full report shape,
+CUDA bootstrap backend, and output review workflow work end-to-end; its small
+denominators and wide intervals must not be used as the primary conclusion.
 
 Each completed run contains `run_manifest.json`, `resource_estimate.json`,
 `handoff.md`, raw scalar/Parquet evidence, CSV tables, figures, and
