@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import math
@@ -245,6 +245,57 @@ def top5_summary(logits: Any, position: int) -> tuple[tuple[int, ...], tuple[flo
     )
 
 
+def refresh_frozen_source_top5(
+    model: Any,
+    branchpoint: BranchPoint,
+    *,
+    mask_token_id: int,
+    strict_top5_mass_gate: float,
+    accounting: ForwardAccounting,
+) -> tuple[BranchPoint | None, dict[str, Any]]:
+    """Freeze source values from the exact replay that will define treatments.
+
+    A source artifact contains the archived exact summary used to locate t*.
+    The experiment itself must not silently mix that archived list with a
+    separately loaded model's branch forwards.  We therefore replay the same
+    fixed t* input once, use *that* full-vocabulary top-5 as the frozen branch
+    candidates, and retain both versions in provenance.  The unchanged natural
+    control trajectory still supplies the state sequence and branch location.
+    """
+
+    import torch
+
+    source, target = branchpoint.pair.source_position, branchpoint.pair.target_position
+    x = torch.tensor([branchpoint.record["token_sequence"]], device=next(model.parameters()).device, dtype=torch.long)
+    if int(x[0, source].item()) != int(mask_token_id) or int(x[0, target].item()) != int(mask_token_id):
+        raise RuntimeError(f"{branchpoint.record['state_key']}: t* source/target mask invariant failed during replay")
+    logits = _forward(model, x, accounting)
+    token_ids, probabilities = top5_summary(logits[0], source)
+    mass = float(sum(probabilities))
+    diagnostics = {
+        "archived_source_top5_token_ids": list(branchpoint.source_top5_token_ids),
+        "archived_source_top5_probabilities": list(branchpoint.source_top5_probabilities),
+        "replayed_source_top5_token_ids": list(token_ids),
+        "replayed_source_top5_probabilities": list(probabilities),
+        "replayed_source_top5_mass": mass,
+        "archived_replayed_top5_token_ids_match": token_ids == branchpoint.source_top5_token_ids,
+        "archived_replayed_top5_probabilities_max_abs_difference": max(
+            abs(left - right) for left, right in zip(probabilities, branchpoint.source_top5_probabilities, strict=True)
+        ),
+    }
+    if mass <= strict_top5_mass_gate:
+        diagnostics["status"] = "replayed_top5_mass_gate_not_met"
+        return None, diagnostics
+    diagnostics["status"] = "retained_after_exact_replay"
+    return replace(
+        branchpoint,
+        source_top5_token_ids=token_ids,
+        source_top5_probabilities=probabilities,
+        source_top5_mass=mass,
+        source_p1=float(probabilities[0]),
+    ), diagnostics
+
+
 def _normal_policy_step(
     input_ids: Any,
     logits: Any,
@@ -413,9 +464,9 @@ def rollout(
 def validate_control_top5(control: Rollout, branchpoint: BranchPoint) -> None:
     """Ensure t* was not accidentally reinterpreted between selection and run."""
 
-    # ``rollout`` already checks the first control forward against the frozen
-    # source list. This guard keeps the invariants explicit before treatments
-    # are scheduled.
+    # ``rollout`` checks the first control forward against this exact replay's
+    # frozen source list. This guard keeps the invariants explicit before
+    # treatments are scheduled.
     if len(branchpoint.source_top5_token_ids) != 5 or len(branchpoint.source_top5_probabilities) != 5:
         raise RuntimeError("A retained branch point must contain exactly five frozen source candidates")
     if branchpoint.source_top5_token_ids[0] is None or not control.records:
@@ -718,6 +769,7 @@ def main() -> None:
             grouped[_group_key(row)].append(row)
     requested = prior_pairs(vccc_root)
     selections: list[dict[str, Any]] = []
+    selection_by_pair: dict[PriorPair, dict[str, Any]] = {}
     retained: list[BranchPoint] = []
     skipped: Counter[str] = Counter()
     for pair in requested:
@@ -751,7 +803,9 @@ def main() -> None:
             skipped[provenance_error] += 1
             continue
         retained.append(branchpoint)
-        selections.append({**base, "status": "retained", **_common(branchpoint)})
+        selection_row = {**base, "status": "retained", **_common(branchpoint)}
+        selections.append(selection_row)
+        selection_by_pair[pair] = selection_row
     if args.smoke:
         retained = retained[:1]
         retained_keys = {item.pair for item in retained}
@@ -768,6 +822,29 @@ def main() -> None:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     accounting = ForwardAccounting(started=time.perf_counter())
+    replay_refreshed: list[BranchPoint] = []
+    for archived_branchpoint in retained:
+        branchpoint, replay_diagnostics = refresh_frozen_source_top5(
+            model,
+            archived_branchpoint,
+            mask_token_id=mask_id,
+            strict_top5_mass_gate=float(config["branch_selection"]["source_top5_mass_strictly_greater_than"]),
+            accounting=accounting,
+        )
+        selection_row = selection_by_pair[archived_branchpoint.pair]
+        selection_row.update(replay_diagnostics)
+        if branchpoint is None:
+            selection_row["status"] = str(replay_diagnostics["status"])
+            skipped[str(replay_diagnostics["status"])] += 1
+            continue
+        # `_common` deliberately replaces the archived source candidates with
+        # the exact t* list that is frozen for every treatment branch.
+        selection_row.update(_common(branchpoint))
+        selection_row["status"] = "retained"
+        replay_refreshed.append(branchpoint)
+    retained = replay_refreshed
+    if not retained:
+        raise RuntimeError("No archived t* pair also passed the strict top-5-mass gate on the exact branch replay.")
     control_records: list[dict[str, Any]] = []
     outcomes: list[dict[str, Any]] = []
     finals: dict[tuple[str, int, int, int], Rollout] = {}
@@ -807,6 +884,7 @@ def main() -> None:
         "exact_cache_policy": "use_cache=False",
         "normal_decoder_policy": str(config["branch_selection"]["required_control_policy"]),
         "strict_top5_mass_gate": float(config["branch_selection"]["source_top5_mass_strictly_greater_than"]),
+        "source_candidate_freeze": "top-5 values/probabilities are refreshed once from the exact t* branch replay; archived values and match diagnostics are retained in branchpoint_pairs.csv",
         "pair_selection": "exact directed primary-polarity pairs from prior VCCC raw artifact; no resampling or replacement",
         "requested_directed_pair_count": len(requested),
         "retained_directed_pair_count": len(retained),
