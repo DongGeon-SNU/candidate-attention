@@ -18,6 +18,14 @@ branch_selection:
   source_top5_mass_strictly_greater_than: 0.9
   required_control_policy: confidence_ge_threshold_plus_argmax_fallback
 
+sampling:
+  # Preserve all 20 directions from the previous polarity pilot, then extend
+  # outcome-blindly from that VCCC run's primary-policy selected states.
+  target_directed_pair_count: 100
+  # Reserve directions make the exact t* replay gate capable of retaining the
+  # requested 100 even if an archived summary proves incompatible on replay.
+  candidate_pool_multiplier: 2
+
 execution:
   exact_measurement_cache_policy: use_cache_false
 

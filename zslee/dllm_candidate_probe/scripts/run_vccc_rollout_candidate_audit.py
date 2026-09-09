@@ -37,6 +37,7 @@ from scripts.run_vccc_oracle_audit import (  # noqa: E402
     ForwardAccounting,
     exact_logits_batched,
     read_jsonl,
+    stable_key,
     write_csv,
     write_json,
     write_jsonl,
@@ -92,8 +93,33 @@ def _summary(record: Mapping[str, Any], position: int) -> Mapping[str, Any] | No
     return value if isinstance(value, Mapping) else None
 
 
-def prior_pairs(vccc_root: Path) -> list[PriorPair]:
-    """Recover the old deterministic polarity sample without reselecting it."""
+def _pair_from_row(row: Mapping[str, Any], *, state_field: str) -> PriorPair | None:
+    """Parse one directed pair while retaining malformed provenance upstream."""
+
+    try:
+        pair = PriorPair(
+            selection_state_key=str(row[state_field]),
+            prompt_id=str(row["prompt_id"]),
+            source_position=int(row["source_position"]),
+            target_position=int(row["target_position"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if pair.source_position == pair.target_position:
+        raise RuntimeError(f"Invalid VCCC polarity pair with identical positions: {pair}")
+    return pair
+
+
+def prior_pairs(vccc_root: Path, target_count: int) -> list[PriorPair]:
+    """Preserve old polarity directions, then expand deterministically to target.
+
+    Expansion uses only primary-policy states already selected by the preceding
+    VCCC audit; it changes sample size, not prompt/model/decoder provenance,
+    and is independent of all rollout outcomes.
+    """
+
+    if target_count < 1:
+        raise ValueError("target_count must be positive")
 
     path = vccc_root / "raw" / "candidate_polarity_assignments.jsonl"
     rows = read_jsonl(path)
@@ -101,21 +127,50 @@ def prior_pairs(vccc_root: Path) -> list[PriorPair]:
     for row in rows:
         if row.get("cohort") != "primary_policy":
             continue
-        try:
-            pair = PriorPair(
-                selection_state_key=str(row["state_key"]),
-                prompt_id=str(row["prompt_id"]),
-                source_position=int(row["source_position"]),
-                target_position=int(row["target_position"]),
-            )
-        except (KeyError, TypeError, ValueError):
+        pair = _pair_from_row(row, state_field="state_key")
+        if pair is None:
             continue
-        if pair.source_position == pair.target_position:
-            raise RuntimeError(f"Invalid VCCC polarity pair with identical positions: {pair}")
         unique.setdefault((pair.selection_state_key, pair.source_position, pair.target_position), pair)
     if not unique:
         raise RuntimeError(f"No primary directed candidate-polarity pairs found in {path}")
-    return sorted(unique.values(), key=lambda item: (item.selection_state_key, item.source_position, item.target_position))
+    preserved = sorted(
+        unique.values(),
+        key=lambda item: stable_key("rollout-preserved-polarity", item.selection_state_key, item.source_position, item.target_position),
+    )
+    if len(preserved) >= target_count:
+        return preserved[:target_count]
+
+    selected_path = vccc_root / "raw" / "selected_states.jsonl"
+    if not selected_path.exists():
+        raise FileNotFoundError(
+            f"Cannot expand beyond {len(preserved)} previous polarity directions without {selected_path}"
+        )
+    expanded: dict[tuple[str, int, int], PriorPair] = {}
+    for state in read_jsonl(selected_path):
+        if state.get("cohort") != "primary_policy":
+            continue
+        try:
+            state_key = str(state["state_key"])
+            prompt_id = str(state["prompt_id"])
+            positions = [int(value) for value in state["assignment_positions"]]
+        except (KeyError, TypeError, ValueError):
+            continue
+        for source_position in positions:
+            for target_position in positions:
+                if source_position == target_position:
+                    continue
+                pair = PriorPair(state_key, prompt_id, source_position, target_position)
+                expanded.setdefault((state_key, source_position, target_position), pair)
+    additions = [pair for key, pair in expanded.items() if key not in unique]
+    additions.sort(
+        key=lambda item: stable_key("rollout-expanded-primary-policy", item.selection_state_key, item.source_position, item.target_position)
+    )
+    result = preserved + additions[: target_count - len(preserved)]
+    if len(result) < target_count:
+        raise RuntimeError(
+            f"Prior VCCC run provides only {len(result)} unique primary-policy directed pairs; requested {target_count}"
+        )
+    return result
 
 
 def _group_key(record: Mapping[str, Any]) -> tuple[str, str, float]:
@@ -363,14 +418,12 @@ def rollout(
     branch_kind: str,
     source_candidate_token_id: int | None,
     source_candidate_probability: float | None,
-    horizon_count: int | None,
 ) -> Rollout:
-    """Run one actual branch; committed-target measurements use shadow copies.
+    """Run one actual branch through its own terminal state.
 
-    ``horizon_count`` is ``None`` for control. Treatments are extended with a
-    terminal *measurement-only* carry-forward to control's final horizon if
-    they finish earlier, making all same-time comparisons well-defined. Those
-    rows are explicitly labelled and never cause a decoder action.
+    Committed-target measurements use shadow copies.  A treatment is never
+    truncated to the control length: forcing a source value can legitimately
+    make its normal decoder rollout longer or shorter than control.
     """
 
     import torch
@@ -387,7 +440,7 @@ def rollout(
     terminal_horizon: int | None = None
     common = _common(branchpoint)
     horizon = 0
-    while horizon_count is None or horizon < horizon_count:
+    while True:
         masked = torch.where(x[0].eq(mask_token_id))[0]
         target_masked = bool(x[0, target].eq(mask_token_id).item())
         terminal = not int(masked.numel())
@@ -453,11 +506,11 @@ def rollout(
         )
         if terminal:
             terminal_horizon = horizon if terminal_horizon is None else terminal_horizon
-            if horizon_count is None:
-                break
+            break
         horizon += 1
-    if final_target is None and not bool(x[0, target].eq(mask_token_id).item()):
-        final_target = int(x[0, target].item())
+    if bool(x[0, target].eq(mask_token_id).item()):
+        raise RuntimeError("Terminal branch unexpectedly retains the target mask")
+    final_target = int(x[0, target].item())
     return Rollout(records=records, final_target_token_id=final_target, terminal_horizon=terminal_horizon)
 
 
@@ -479,11 +532,35 @@ def compare_same_time(control: Rollout, treatment: Rollout) -> list[dict[str, An
     for row in treatment.records:
         control_row = by_horizon.get(int(row["horizon"]))
         if control_row is None:
-            raise RuntimeError("Treatment has a horizon without a same-time control measurement")
+            # The treatment has not ended yet, but its paired control has.
+            # Keep the branch measurement for complete provenance; a
+            # candidate-induced flip is undefined without a same-time control.
+            output.append(
+                {
+                    **row,
+                    "same_time_control_available": False,
+                    "control_target_top1_token_id": None,
+                    "control_target_top2_token_id": None,
+                    "control_target_top1_probability": None,
+                    "control_target_top2_probability": None,
+                    "control_target_logit_margin": None,
+                    "control_target_probability_margin": None,
+                    "treatment_target_top1_token_id": row["target_top1_token_id"],
+                    "treatment_target_top2_token_id": row["target_top2_token_id"],
+                    "treatment_target_top1_probability": row["target_top1_probability"],
+                    "treatment_target_top2_probability": row["target_top2_probability"],
+                    "treatment_target_logit_margin": row["target_logit_margin"],
+                    "treatment_target_probability_margin": row["target_probability_margin"],
+                    "induced_flip": None,
+                    "changed_to": None,
+                }
+            )
+            continue
         changed = int(row["target_top1_token_id"]) != int(control_row["target_top1_token_id"])
         output.append(
             {
                 **row,
+                "same_time_control_available": True,
                 "control_target_top1_token_id": control_row["target_top1_token_id"],
                 "control_target_top2_token_id": control_row["target_top2_token_id"],
                 "control_target_top1_probability": control_row["target_top1_probability"],
@@ -516,9 +593,16 @@ def annotate_branch_outcomes(rows: Sequence[dict[str, Any]], final: Rollout) -> 
     """Attach branch-level outcomes to every horizon row after rollout ends."""
 
     ordered = sorted(rows, key=lambda row: int(row["horizon"]))
-    flips = [row for row in ordered if bool(row["induced_flip"])]
+    flips = [row for row in ordered if row.get("induced_flip") is True]
     first = int(flips[0]["horizon"]) if flips else None
-    later_return = bool(first is not None and any(not bool(row["induced_flip"]) for row in ordered if int(row["horizon"]) > first))
+    later_return = bool(
+        first is not None
+        and any(
+            row.get("same_time_control_available") is True and row.get("induced_flip") is False
+            for row in ordered
+            if int(row["horizon"]) > first
+        )
+    )
     for row in rows:
         row["first_induced_flip_horizon"] = first
         row["returns_to_same_time_control_top1_after_first_flip"] = later_return
@@ -541,9 +625,16 @@ def branch_summaries(rows: Sequence[Mapping[str, Any]], finals: Mapping[tuple[st
     result: list[dict[str, Any]] = []
     for key, members in sorted(grouped.items()):
         ordered = sorted(members, key=lambda row: int(row["horizon"]))
-        flips = [row for row in ordered if bool(row["induced_flip"])]
+        flips = [row for row in ordered if row.get("induced_flip") is True]
         first = int(flips[0]["horizon"]) if flips else None
-        later_return = bool(first is not None and any(not bool(row["induced_flip"]) for row in ordered if int(row["horizon"]) > first))
+        later_return = bool(
+            first is not None
+            and any(
+                row.get("same_time_control_available") is True and row.get("induced_flip") is False
+                for row in ordered
+                if int(row["horizon"]) > first
+            )
+        )
         final = finals[key]
         source = ordered[0]
         result.append(
@@ -555,6 +646,8 @@ def branch_summaries(rows: Sequence[Mapping[str, Any]], finals: Mapping[tuple[st
                 "source_candidate_token_id": key[3],
                 "source_candidate_probability": source["source_candidate_probability"],
                 "horizon_record_count": len(ordered),
+                "same_time_comparable_horizon_count": sum(row.get("same_time_control_available") is True for row in ordered),
+                "post_control_horizon_count": sum(row.get("same_time_control_available") is False for row in ordered),
                 "first_induced_flip_horizon": first,
                 "ever_induced_flip": bool(flips),
                 "returns_to_same_time_control_top1_after_first_flip": later_return,
@@ -568,6 +661,8 @@ def branch_summaries(rows: Sequence[Mapping[str, Any]], finals: Mapping[tuple[st
 def heterogeneity_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, int, int, int], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
+        if row.get("same_time_control_available") is not True:
+            continue
         grouped[(
             str(row["branchpoint_state_key"]),
             int(row["source_position"]),
@@ -576,7 +671,7 @@ def heterogeneity_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]
         )].append(row)
     output: list[dict[str, Any]] = []
     for (state_key, source_position, target_position, horizon), members in sorted(grouped.items()):
-        flip_values = {bool(row["induced_flip"]) for row in members}
+        flip_values = {row["induced_flip"] for row in members}
         replacements = {int(row["changed_to"]) for row in members if row.get("changed_to") is not None}
         source = members[0]
         output.append(
@@ -601,6 +696,8 @@ def pair_heterogeneity_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
 
     grouped: dict[tuple[str, int, int], list[Mapping[str, Any]]] = defaultdict(list)
     for row in rows:
+        if row.get("same_time_control_available") is not True:
+            continue
         grouped[(
             str(row["branchpoint_state_key"]),
             int(row["source_position"]),
@@ -611,7 +708,7 @@ def pair_heterogeneity_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
         by_candidate: dict[int, list[Mapping[str, Any]]] = defaultdict(list)
         for row in members:
             by_candidate[int(row["source_candidate_token_id"])].append(row)
-        ever_flip = {candidate: any(bool(row["induced_flip"]) for row in candidate_rows) for candidate, candidate_rows in by_candidate.items()}
+        ever_flip = {candidate: any(row["induced_flip"] is True for row in candidate_rows) for candidate, candidate_rows in by_candidate.items()}
         replacements = {
             int(row["changed_to"])
             for row in members
@@ -636,10 +733,15 @@ def pair_heterogeneity_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str,
 
 
 def rate(rows: Sequence[Mapping[str, Any]], *, active_only: bool) -> dict[str, Any]:
-    chosen = [row for row in rows if not active_only or not bool(row["branch_terminal_before_action"])]
-    numerator = sum(bool(row["induced_flip"]) for row in chosen)
+    chosen = [
+        row
+        for row in rows
+        if row.get("same_time_control_available") is True
+        and (not active_only or not bool(row["branch_terminal_before_action"]))
+    ]
+    numerator = sum(row["induced_flip"] is True for row in chosen)
     return {
-        "scope": "active_rollout_horizons_only" if active_only else "all_same_time_horizons_including_terminal_measurement_carry",
+        "scope": "same_time_control_active_horizons_only" if active_only else "all_genuine_same_time_control_horizons",
         "induced_flip_numerator": numerator,
         "induced_flip_denominator": len(chosen),
         "induced_flip_rate": numerator / len(chosen) if chosen else None,
@@ -666,13 +768,14 @@ def write_report(
     metadata: Mapping[str, Any],
 ) -> dict[str, Any]:
     retained = [row for row in selections if row.get("status") == "retained"]
+    target_pair_count = int(metadata["target_directed_pair_count"])
     flip_rate_all = rate(outcomes, active_only=False)
     flip_rate_active = rate(outcomes, active_only=True)
     flip_hetero = sum(bool(row["candidate_ever_flip_outcome_heterogeneous"]) for row in pair_heterogeneity)
     token_hetero = sum(bool(row["candidate_replacement_token_heterogeneous_across_horizons"]) for row in pair_heterogeneity)
     direct = {
         "retained_directed_pairs": len(retained),
-        "requested_directed_pairs": len(selections),
+        "requested_directed_pairs": target_pair_count,
         "overall_induced_flip_rate": flip_rate_all,
         "active_rollout_induced_flip_rate": flip_rate_active,
         "tstar_source_target_tuples_with_candidate_flip_outcome_heterogeneity": flip_hetero,
@@ -685,9 +788,9 @@ def write_report(
         "",
         "## Direct answers",
         "",
-        f"1. Retained directed source--target pairs: {len(retained)}/{len(selections)}.",
-        f"2. Overall same-time-control induced flips: {flip_rate_all['induced_flip_numerator']}/{flip_rate_all['induced_flip_denominator']} ({(100 * flip_rate_all['induced_flip_rate']) if flip_rate_all['induced_flip_rate'] is not None else 0.0:.2f}%).",
-        f"3. Active-rollout-only induced flips: {flip_rate_active['induced_flip_numerator']}/{flip_rate_active['induced_flip_denominator']} ({(100 * flip_rate_active['induced_flip_rate']) if flip_rate_active['induced_flip_rate'] is not None else 0.0:.2f}%).",
+        f"1. Retained directed source--target pairs: {len(retained)}/{target_pair_count} target (from {metadata['candidate_pool_pair_count']} deterministic candidate directions).",
+        f"2. Overall genuine same-time-control induced flips: {flip_rate_all['induced_flip_numerator']}/{flip_rate_all['induced_flip_denominator']} ({(100 * flip_rate_all['induced_flip_rate']) if flip_rate_all['induced_flip_rate'] is not None else 0.0:.2f}%).",
+        f"3. Same-time induced flips on pre-terminal-action horizons: {flip_rate_active['induced_flip_numerator']}/{flip_rate_active['induced_flip_denominator']} ({(100 * flip_rate_active['induced_flip_rate']) if flip_rate_active['induced_flip_rate'] is not None else 0.0:.2f}%).",
         f"4. Candidate ever-flip heterogeneity: {flip_hetero}/{len(pair_heterogeneity)} (t*, i, j) tuples.",
         f"5. Candidate replacement-token heterogeneity across horizons: {token_hetero}/{len(pair_heterogeneity)} (t*, i, j) tuples.",
         "",
@@ -695,15 +798,15 @@ def write_report(
         "",
         "For each retained directed pair, t* is the first saved original-control state with both positions masked and source M5 strictly greater than 0.9. The five source candidates (including current top-1) and their probabilities are frozen from that state. The control and all treatments use the original p1>=0.9 threshold-plus-argmax-fallback decoder action at every active step. Treatment source insertion occurs only at t*.",
         "",
-        "When the target is committed, target predictions come from a shadow copy with only the target re-masked. The shadow pass is measurement-only and never changes the real rollout. `induced_flip` always compares with the control prediction at the identical horizon, not the target's prediction at t*.",
+        "When the target is committed, target predictions come from a shadow copy with only the target re-masked. The shadow pass is measurement-only and never changes the real rollout. Every treatment runs through its own terminal state, so its final actual target token is always recorded. `induced_flip` is defined only when the unchanged control has an identical horizon; treatment rows after control has ended retain their measurement but set `same_time_control_available=false` and `induced_flip=null`.",
         "",
-        "Terminal carry rows preserve a completed treatment's final actual state only to make same-time comparisons through the control terminal horizon possible. The report separately gives active-rollout-only rates so these rows cannot be mistaken for new decoder actions.",
+        "No terminal carry-forward rows are synthesized. The all-horizons rate includes each genuine terminal-state measurement at most once; the pre-terminal-action rate excludes those terminal measurements.",
         "",
         "## Artifacts",
         "",
         "- `tables/branchpoint_pairs.csv`: retained/skipped pairs, t*, M5, p1, frozen top-5 tokens and probabilities.",
-        "- `tables/target_horizon_outcomes.csv`: same-time control/treatment predictions and induced flips at every horizon.",
-        "- `tables/branch_summaries.csv`: first flip, later return to control top-1, and final actual target token per candidate branch.",
+        "- `tables/target_horizon_outcomes.csv`: treatment predictions at every genuine branch horizon, with same-time control fields and `induced_flip` only where a control horizon exists.",
+        "- `tables/branch_summaries.csv`: first comparable flip, later comparable return to control top-1, final actual target token, and comparable/post-control horizon counts per candidate branch.",
         "- `tables/candidate_heterogeneity.csv`: horizon-level candidate-conditioned variation.",
         "- `tables/candidate_pair_heterogeneity.csv`: the requested (t*, i, j)-level variation aggregated across horizons.",
         "",
@@ -767,7 +870,9 @@ def main() -> None:
     for row in trajectories:
         if row.get("setting") == "primary" and float(row.get("threshold", -1.0)) == float(config["decoding"]["threshold"]):
             grouped[_group_key(row)].append(row)
-    requested = prior_pairs(vccc_root)
+    target_pair_count = 1 if args.smoke else int(config["sampling"]["target_directed_pair_count"])
+    candidate_pool_pair_count = max(target_pair_count, target_pair_count * int(config["sampling"]["candidate_pool_multiplier"]))
+    requested = prior_pairs(vccc_root, candidate_pool_pair_count)
     selections: list[dict[str, Any]] = []
     selection_by_pair: dict[PriorPair, dict[str, Any]] = {}
     retained: list[BranchPoint] = []
@@ -803,13 +908,23 @@ def main() -> None:
             skipped[provenance_error] += 1
             continue
         retained.append(branchpoint)
-        selection_row = {**base, "status": "retained", **_common(branchpoint)}
+        selection_row = {**base, "status": "eligible_pending_exact_replay", **_common(branchpoint)}
         selections.append(selection_row)
         selection_by_pair[pair] = selection_row
     if args.smoke:
         retained = retained[:1]
         retained_keys = {item.pair for item in retained}
-        selections = [row for row in selections if row.get("status") != "retained" or any(pair.selection_state_key == row["selection_state_key"] and pair.source_position == row["source_position"] and pair.target_position == row["target_position"] for pair in retained_keys)]
+        selections = [
+            row
+            for row in selections
+            if row.get("status") != "eligible_pending_exact_replay"
+            or any(
+                pair.selection_state_key == row["selection_state_key"]
+                and pair.source_position == row["source_position"]
+                and pair.target_position == row["target_position"]
+                for pair in retained_keys
+            )
+        ]
     if not retained:
         raise RuntimeError("No prior VCCC polarity pair passed the required t* eligibility condition.")
 
@@ -840,30 +955,32 @@ def main() -> None:
         # `_common` deliberately replaces the archived source candidates with
         # the exact t* list that is frozen for every treatment branch.
         selection_row.update(_common(branchpoint))
+        if len(replay_refreshed) >= target_pair_count:
+            selection_row["status"] = "eligible_reserve_after_exact_replay"
+            continue
         selection_row["status"] = "retained"
         replay_refreshed.append(branchpoint)
     retained = replay_refreshed
-    if not retained:
-        raise RuntimeError("No archived t* pair also passed the strict top-5-mass gate on the exact branch replay.")
+    if len(retained) < target_pair_count:
+        raise RuntimeError(
+            f"Only {len(retained)}/{target_pair_count} candidate directions passed the exact t* replay gate; expand the deterministic pool."
+        )
     control_records: list[dict[str, Any]] = []
     outcomes: list[dict[str, Any]] = []
     finals: dict[tuple[str, int, int, int], Rollout] = {}
     for pair_index, branchpoint in enumerate(retained, 1):
         control = rollout(
             model, branchpoint, mask_token_id=mask_id, threshold=float(config["decoding"]["threshold"]), accounting=accounting,
-            branch_kind="control", source_candidate_token_id=None, source_candidate_probability=None, horizon_count=None,
+            branch_kind="control", source_candidate_token_id=None, source_candidate_probability=None,
         )
         validate_control_top5(control, branchpoint)
         annotate_control_records(control.records, control)
         control_records.extend(control.records)
-        horizon_count = len(control.records)
         for token, probability in zip(branchpoint.source_top5_token_ids, branchpoint.source_top5_probabilities, strict=True):
             treatment = rollout(
                 model, branchpoint, mask_token_id=mask_id, threshold=float(config["decoding"]["threshold"]), accounting=accounting,
-                branch_kind="treatment", source_candidate_token_id=token, source_candidate_probability=probability, horizon_count=horizon_count,
+                branch_kind="treatment", source_candidate_token_id=token, source_candidate_probability=probability,
             )
-            if len(treatment.records) != horizon_count:
-                raise RuntimeError("Treatment did not emit every same-time control horizon")
             compared = compare_same_time(control, treatment)
             annotate_branch_outcomes(compared, treatment)
             outcomes.extend(compared)
@@ -885,11 +1002,14 @@ def main() -> None:
         "normal_decoder_policy": str(config["branch_selection"]["required_control_policy"]),
         "strict_top5_mass_gate": float(config["branch_selection"]["source_top5_mass_strictly_greater_than"]),
         "source_candidate_freeze": "top-5 values/probabilities are refreshed once from the exact t* branch replay; archived values and match diagnostics are retained in branchpoint_pairs.csv",
-        "pair_selection": "exact directed primary-polarity pairs from prior VCCC raw artifact; no resampling or replacement",
-        "requested_directed_pair_count": len(requested),
+        "pair_selection": "preserved prior primary-polarity directions plus deterministic, outcome-blind expansion from the same prior VCCC primary-policy selected states",
+        "target_directed_pair_count": target_pair_count,
+        "candidate_pool_pair_count": len(requested),
+        "candidate_directions_considered_count": len(selections),
         "retained_directed_pair_count": len(retained),
         "skipped_pair_reasons": dict(sorted(skipped.items())),
-        "same_time_control_definition": "compare treatment and unchanged control target argmax at identical horizon after t*",
+        "same_time_control_definition": "compare treatment and unchanged control target argmax at identical horizon after t*; treatment-only post-control horizons retain measurements but induced_flip=null",
+        "treatment_termination": "every forced-candidate branch is rolled out through its own terminal state; no terminal carry-forward rows are synthesized",
         "shadow_probe_definition": "if target is committed, copy current actual branch state, replace only target by mask, exact forward; never feed result into branch",
         "forward_accounting": accounting.__dict__,
         "runtime_seconds": runtime_seconds,

@@ -185,9 +185,11 @@ invocation.
 
 ## VCCC offline candidate-conditioned rollout audit
 
-This continuation reuses the exact directed primary candidate-polarity pairs
-from a completed VCCC run; it does not resample prompts or select replacement
-pairs. For each direction it finds the first source-control state `t*` where
+This continuation preserves the exact 20 directed primary candidate-polarity
+pairs from a completed VCCC run, then expands outcome-blindly to 100 directed
+pairs using only that run's already selected `primary_policy` states. It does
+not resample prompts or select pairs by observed rollout effect. For each
+direction it finds the first source-control state `t*` where
 source and target remain masked and source full-vocabulary `M5` is strictly
 above `0.9`. It freezes source top-5 candidates/probabilities at that state.
 
@@ -198,6 +200,12 @@ one frozen source candidate at `t*` and then uses exactly the normal
 with the same-time control at every horizon. When the target is already
 committed, a shadow target-mask forward measures its ordinary prediction but
 never feeds back into the branch state.
+
+Every treatment is run until its *own* decoder termination, rather than being
+truncated at the control's length. A forced candidate can alter reveal timing,
+so post-control treatment horizons are retained for final-token provenance but
+have `same_time_control_available=false` and `induced_flip=null`; they are not
+included in any induced-flip or candidate-heterogeneity statistic.
 
 Use the known paired source/VCCC runs (the second argument must be the VCCC
 run that produced the prior polarity matrices):

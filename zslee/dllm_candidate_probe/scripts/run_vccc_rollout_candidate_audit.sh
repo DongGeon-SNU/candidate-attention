@@ -23,8 +23,8 @@ if [[ ! -f "${SOURCE_RUN}/run_manifest.json" || ! -f "${SOURCE_RUN}/raw/trajecto
   echo "Source run must contain run_manifest.json and raw/trajectories.jsonl: ${SOURCE_RUN}" >&2
   exit 2
 fi
-if [[ ! -f "${VCCC_RUN}/run_metadata.json" || ! -f "${VCCC_RUN}/raw/candidate_polarity_assignments.jsonl" ]]; then
-  echo "VCCC run must contain run_metadata.json and raw/candidate_polarity_assignments.jsonl: ${VCCC_RUN}" >&2
+if [[ ! -f "${VCCC_RUN}/run_metadata.json" || ! -f "${VCCC_RUN}/raw/candidate_polarity_assignments.jsonl" || ! -f "${VCCC_RUN}/raw/selected_states.jsonl" ]]; then
+  echo "VCCC run must contain run_metadata.json, raw/candidate_polarity_assignments.jsonl, and raw/selected_states.jsonl: ${VCCC_RUN}" >&2
   exit 2
 fi
 PYTHON_BIN="${PROBE_ROOT}/.venv/bin/python"
