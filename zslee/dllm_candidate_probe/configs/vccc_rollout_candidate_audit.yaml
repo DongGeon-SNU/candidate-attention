@@ -1,0 +1,24 @@
+# Offline continuation of a completed VCCC candidate-polarity run.  The
+# source/model/decoder provenance is checked against both supplied inputs.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  # Exactly the normal collector policy; this is not a treatment parameter.
+  threshold: 0.9
+
+branch_selection:
+  # Protocol uses a strict inequality: M5 == 0.9 is not eligible.
+  source_top5_mass_strictly_greater_than: 0.9
+  required_control_policy: confidence_ge_threshold_plus_argmax_fallback
+
+execution:
+  exact_measurement_cache_policy: use_cache_false
+
+storage:
+  # Intentionally matches the preceding VCCC audit's output location. Each
+  # invocation still creates a distinct timestamped child directory.
+  output_root: outputs/vccc_oracle_audit

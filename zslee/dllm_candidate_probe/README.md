@@ -183,6 +183,45 @@ modifies another process. If `nvidia-smi` shows the only process is this job,
 explicitly acknowledge that fact with `VCCC_ORACLE_ALLOW_BUSY_GPU=1` for that
 invocation.
 
+## VCCC offline candidate-conditioned rollout audit
+
+This continuation reuses the exact directed primary candidate-polarity pairs
+from a completed VCCC run; it does not resample prompts or select replacement
+pairs. For each direction it finds the first source-control state `t*` where
+source and target remain masked and source full-vocabulary `M5` is strictly
+above `0.9`. It freezes source top-5 candidates/probabilities at that state.
+
+Unlike the prior candidate-polarity matrix, it runs an unchanged normal decoder
+rollout: control has no forced insertion, while each of five treatments forces
+one frozen source candidate at `t*` and then uses exactly the normal
+`p1 >= 0.9` threshold-plus-argmax-fallback policy. Target top-1 is compared
+with the same-time control at every horizon. When the target is already
+committed, a shadow target-mask forward measures its ordinary prediction but
+never feeds back into the branch state.
+
+Use the known paired source/VCCC runs (the second argument must be the VCCC
+run that produced the prior polarity matrices):
+
+```bash
+export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
+cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
+
+bash scripts/run_vccc_rollout_candidate_audit.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z \
+  outputs/vccc_oracle_audit/20260908T144726Z --smoke
+
+bash scripts/run_vccc_rollout_candidate_audit.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z \
+  outputs/vccc_oracle_audit/20260908T144726Z
+```
+
+The output remains under `outputs/vccc_oracle_audit/<new timestamp>/`, with
+`tables/branchpoint_pairs.csv`, `tables/target_horizon_outcomes.csv`,
+`tables/branch_summaries.csv`, `tables/candidate_heterogeneity.csv`, and
+`tables/candidate_pair_heterogeneity.csv`. If
+the sole reported GPU process is this job, acknowledge it explicitly with
+`VCCC_ROLLOUT_ALLOW_BUSY_GPU=1`.
+
 ## Output policy
 
 Only scalar statistics, IDs, and top-k probabilities are written. Full-vocabulary distributions are reduced on GPU and never saved; attention maps, hidden states, and KV tensors are never stored. Runtime outputs, virtual environments, caches, and vendor source are ignored by Git. `outputs/summary.md` is generated after smoke/pilot and records the model, dtype, source pin, seed, metrics, and result paths.
