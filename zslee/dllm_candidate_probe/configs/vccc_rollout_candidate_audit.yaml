@@ -8,6 +8,9 @@ model:
 
 decoding:
   # Exactly the normal collector policy; this is not a treatment parameter.
+  # Retained because the shared frozen-model loader records a reproducible
+  # PyTorch seed even though all rollout actions are deterministic argmaxes.
+  seed: 20260902
   threshold: 0.9
 
 branch_selection:
