@@ -230,6 +230,54 @@ The output remains under `outputs/vccc_oracle_audit/<new timestamp>/`, with
 the sole reported GPU process is this job, acknowledge it explicitly with
 `VCCC_ROLLOUT_ALLOW_BUSY_GPU=1`.
 
+## Exact top-1 VCCC oracle headroom audit
+
+This separate offline audit asks the core GO/NO-GO question: can an exact
+all-order certificate make the **current exact top-1** Fast-dLLM commit batch
+larger without changing any token values? It reads the completed primary
+top-1 trajectory bundle, preserves the recorded confidence-plus-fallback
+Fast-dLLM batch `B`, and creates `P = B +` the highest-confidence remaining
+masked positions for `M=4,6,8`. A stratum with `|B| > M` is logged as
+ineligible; `B` is never truncated.
+
+For each pool it forwards every subset context exactly once with
+`use_cache=False`, then checks every target under every subset of the other
+selected positions. The preserving extension can only return `B ∪ T`; if `B`
+itself fails, that is reported explicitly rather than converted to zero extra
+capacity. The free oracle is a separately labelled upper bound because it may
+drop a Fast-dLLM token. No candidate values, forced branches, learned score,
+or long-horizon rollout is part of this audit.
+
+Run it after pulling the commit containing this runner:
+
+```bash
+export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
+cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
+
+# First check the artifact shape with one deterministic primary state.
+bash scripts/run_exact_top1_vccc_oracle_headroom.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z --smoke
+
+# Primary 100-prompt state audit.
+bash scripts/run_exact_top1_vccc_oracle_headroom.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z
+```
+
+The audit creates
+`outputs/vccc_oracle_audit/exact_top1_vccc_oracle_headroom_<timestamp>/`.
+Open `report.md` first. `tables/state_pool_selection.csv` records every source
+state/M eligibility decision; `tables/policy_state_results.csv` and
+`tables/token_certificate_witnesses.csv` contain exact certificates and query
+witnesses; `tables/headroom_summary.csv` contains prompt-clustered CIs; and
+`tables/matched_risk_test.csv` selects confidence thresholds only on hashed
+calibration prompts before reporting held-out test results. Exact verification
+forwards are reported separately from the idealized cheap-predictor NFE proxy,
+so the report makes no wall-clock speedup claim.
+
+As with the other shared-GPU wrappers, it will not run alongside an existing
+compute process. Only when the sole process is this audit itself may the job
+owner set `EXACT_TOP1_VCCC_HEADROOM_ALLOW_BUSY_GPU=1` for that invocation.
+
 ## Output policy
 
 Only scalar statistics, IDs, and top-k probabilities are written. Full-vocabulary distributions are reduced on GPU and never saved; attention maps, hidden states, and KV tensors are never stored. Runtime outputs, virtual environments, caches, and vendor source are ignored by Git. `outputs/summary.md` is generated after smoke/pilot and records the model, dtype, source pin, seed, metrics, and result paths.
