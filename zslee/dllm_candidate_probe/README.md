@@ -183,6 +183,41 @@ modifies another process. If `nvidia-smi` shows the only process is this job,
 explicitly acknowledge that fact with `VCCC_ORACLE_ALLOW_BUSY_GPU=1` for that
 invocation.
 
+## Top-5-mass branch-point candidate-polarity audit
+
+This separate continuation preserves the prior context-only candidate-polarity
+matrix, but restricts every directed source--target pair to its earliest
+natural control state `t*` where both positions are still masked and the
+source's full-vocabulary top-5 probability mass is **strictly** above `0.9`.
+The existing natural confidence-threshold-plus-fallback trajectory is reused
+unchanged; it is not re-decoded under a different control rule. The source
+top-5 values and probabilities from `t*` are frozen, and each treatment is a
+same-length no-cache forward that forces exactly one of those five values at
+the source. It does not continue a post-treatment trajectory, so its estimand
+remains context-only polarity rather than post-intervention generation quality.
+
+```bash
+export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
+cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
+
+# First do the two-direction / one-unordered-pair smoke run.
+bash scripts/run_top5_mass_branchpoint_audit.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z --smoke
+
+# Then run the same ten deterministic representative unordered pairs used by
+# the prior polarity selection.  Unqualified directions are explicitly logged
+# as skipped, never replaced post hoc.
+bash scripts/run_top5_mass_branchpoint_audit.sh \
+  outputs/top1_dynamics_audit/20260908T130232Z
+```
+
+Each new timestamped output directory contains `report.md`,
+`tables/branchpoint_pairs.csv`, and `tables/candidate_polarity.csv`. The first
+table records `t*`, source `M5`, source `p1`, and all five frozen source-token
+probabilities for both retained and skipped directed pairs. The second records
+every target-margin matrix cell. If the scheduler reports this job itself as
+busy, acknowledge only that fact with `TOP5_BRANCHPOINT_ALLOW_BUSY_GPU=1`.
+
 ## Output policy
 
 Only scalar statistics, IDs, and top-k probabilities are written. Full-vocabulary distributions are reduced on GPU and never saved; attention maps, hidden states, and KV tensors are never stored. Runtime outputs, virtual environments, caches, and vendor source are ignored by Git. `outputs/summary.md` is generated after smoke/pilot and records the model, dtype, source pin, seed, metrics, and result paths.

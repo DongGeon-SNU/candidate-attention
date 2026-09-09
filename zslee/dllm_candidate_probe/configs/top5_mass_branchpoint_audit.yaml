@@ -1,0 +1,35 @@
+# Frozen context-only candidate-polarity audit with a predeclared branch-point
+# gate.  It reads a completed top1_dynamics_audit trajectory and never alters
+# the control trajectory that produced that evidence.
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
+  hf_revision: main
+  dtype: auto
+
+decoding:
+  # This is provenance for the reused natural control trajectory.  The new
+  # runner adds no altered-policy control rollout.
+  threshold: 0.9
+
+sampling:
+  primary_threshold: 0.9
+  set_sizes: [2, 3, 4, 6, 8]
+  primary_states_per_size: 25
+  hard_states_per_size: 12
+  representative_unordered_pair_count: 10
+  # Strict inequality: M5 == 0.9 is intentionally ineligible.
+  source_top5_mass_strictly_greater_than: 0.9
+  target_candidate_modes: [fixed_k4, fixed_k8, adaptive_mass]
+  adaptive_mass: 0.80
+  adaptive_k_max: 8
+
+certificate:
+  tie_tolerance: 1.0e-7
+
+execution:
+  treatment_batch_size: 5
+  exact_measurement_cache_policy: use_cache_false
+
+storage:
+  output_root: outputs/top5_mass_branchpoint_audit
