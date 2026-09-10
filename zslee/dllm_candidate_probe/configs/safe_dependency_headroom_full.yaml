@@ -1,0 +1,32 @@
+model:
+  name: GSAI-ML/LLaDA-8B-Instruct
+  hf_revision: main
+  dtype: bfloat16
+  dapd_repo: https://github.com/quasar529/DAPD.git
+  dapd_commit: 05727b08da4cb4008a275123d7d9885dd5714f7c
+decoding:
+  seed: 20260911
+  generation_length: 256
+  steps: 256
+  block_length: 256
+  temperature: 0.0
+  top_p: null
+  remasking: low_confidence
+  fast_threshold: 0.9
+  mask_id: 126336
+  eos_policy: fixed_generation_length_no_early_stop
+  position_indexing: absolute_prompt_plus_generation_offset
+  use_cache: false
+dapd:
+  algorithm: dapd_direct
+  layer_ratio: 0.3
+  tau_min: 0.01
+  tau_max: 0.05
+prompts: []
+prompt_file: prompts/safe_dependency_headroom_primary.jsonl
+analysis:
+  bootstrap_replicates: 10000
+  bootstrap_seed: 20260911
+  dependency_bins: [0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0000001]
+storage:
+  output_root: results/safe_dependency_headroom_full

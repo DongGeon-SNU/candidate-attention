@@ -56,6 +56,18 @@ git -C "${FAST_DIR}" fetch --tags --force
 git -C "${FAST_DIR}" checkout --detach "${FAST_COMMIT}"
 git -C "${FAST_DIR}" rev-parse HEAD | tee "${PROBE_ROOT}/outputs/fast_dllm_commit.txt"
 "${PYTHON_BIN}" -m pip install -r "${FAST_DIR}/v1/requirements.txt"
+
+# DAPD is independently pinned because this audit must use its published
+# attention graph and independent-set rule, not an in-project approximation.
+DAPD_DIR="${PROBE_ROOT}/vendor/DAPD"
+DAPD_REPO="https://github.com/quasar529/DAPD.git"
+DAPD_COMMIT="05727b08da4cb4008a275123d7d9885dd5714f7c"
+if [[ ! -d "${DAPD_DIR}/.git" ]]; then
+  git clone "${DAPD_REPO}" "${DAPD_DIR}"
+fi
+git -C "${DAPD_DIR}" fetch --tags --force
+git -C "${DAPD_DIR}" checkout --detach "${DAPD_COMMIT}"
+git -C "${DAPD_DIR}" rev-parse HEAD | tee "${PROBE_ROOT}/outputs/dapd_commit.txt"
 "${PYTHON_BIN}" -m unittest discover -s "${PROBE_ROOT}/tests" -p "test_*.py"
 "${PYTHON_BIN}" -m pip freeze | sort > "${PROBE_ROOT}/outputs/dependency_versions.txt"
 echo "setup completed; log: ${LOG_FILE}"
