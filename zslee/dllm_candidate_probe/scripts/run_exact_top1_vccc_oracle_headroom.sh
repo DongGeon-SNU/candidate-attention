@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Exact all-order current-top1 VCCC headroom audit.  This reads one completed
-# top1 trajectory bundle and writes a new child under outputs/vccc_oracle_audit.
+# Experiment 3: exact all-order top-1 VCCC rollout oracle checking. This reads
+# completed primary t=0 seeds and writes a new child under outputs/vccc_oracle_audit.
 set -euo pipefail
 
 PROBE_ROOT="${DLLM_PROBE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -19,8 +19,8 @@ if [[ $# -lt 1 ]]; then
 fi
 SOURCE_RUN="$1"
 shift
-if [[ ! -f "${SOURCE_RUN}/run_manifest.json" || ! -f "${SOURCE_RUN}/raw/trajectories.jsonl" || ! -f "${SOURCE_RUN}/raw/state_positions.jsonl" ]]; then
-  echo "Source run must contain run_manifest.json, raw/trajectories.jsonl, and raw/state_positions.jsonl: ${SOURCE_RUN}" >&2
+if [[ ! -f "${SOURCE_RUN}/run_manifest.json" || ! -f "${SOURCE_RUN}/raw/trajectories.jsonl" ]]; then
+  echo "Source run must contain run_manifest.json and raw/trajectories.jsonl: ${SOURCE_RUN}" >&2
   exit 2
 fi
 PYTHON_BIN="${PROBE_ROOT}/.venv/bin/python"
@@ -57,4 +57,4 @@ export HF_DATASETS_CACHE="${HF_HOME}/datasets"
   --probe-root "${PROBE_ROOT}" \
   --source-run "${SOURCE_RUN}" \
   "$@"
-echo "Exact top-1 VCCC headroom audit finished; inspect report.md under outputs/vccc_oracle_audit/exact_top1_vccc_oracle_headroom_*. Log: ${LOG_FILE}"
+echo "Exact VCCC oracle checking finished; inspect report.md under outputs/vccc_oracle_audit/exact_top1_vccc_oracle_headroom_*. Log: ${LOG_FILE}"

@@ -31,6 +31,14 @@ bash scripts/run_smoke.sh
 bash scripts/run_pilot.sh
 ```
 
+## Safe Dependency Headroom / Terminal Token Agreement
+
+The DAPD-vs-Fast-dLLM terminal-token agreement instrumentation and the
+fail-closed DEMASK asset requirement are documented in
+[`SAFE_DEPENDENCY_HEADROOM.md`](SAFE_DEPENDENCY_HEADROOM.md). Run the five
+prompt H100 smoke test with `bash scripts/run_safe_dependency_headroom_smoke.sh`
+after `scripts/setup.sh`.
+
 Each command creates a timestamped file under `logs/`. The smoke stage uses one prompt and one low-parallel decoding state with branch microbatch one. It measures GPU peak allocation and timing and writes `outputs/resource_estimate.md`. The pilot command will refuse to start unless that estimate is at most 30 minutes; it then uses at most ten prompts and two collected states per prompt.
 
 For an ephemeral Kubernetes job, mount the same persistent volume at the same path for every stage and run one of the commands above as the job command. Do not rely on the container filesystem for code, caches, logs, or results.
@@ -230,23 +238,34 @@ The output remains under `outputs/vccc_oracle_audit/<new timestamp>/`, with
 the sole reported GPU process is this job, acknowledge it explicitly with
 `VCCC_ROLLOUT_ALLOW_BUSY_GPU=1`.
 
-## Exact top-1 VCCC oracle headroom audit
+## Experiment 3: Exact VCCC oracle checking
 
-This separate offline audit asks the core GO/NO-GO question: can an exact
-all-order certificate make the **current exact top-1** Fast-dLLM commit batch
-larger without changing any token values? It reads the completed primary
-top-1 trajectory bundle, preserves the recorded confidence-plus-fallback
-Fast-dLLM batch `B`, and creates `P = B +` the highest-confidence remaining
-masked positions for `M=4,6,8`. A stratum with `|B| > M` is logged as
-ineligible; `B` is never truncated.
+This is a fresh policy-rollout experiment, not the earlier static headroom
+audit. It uses the completed primary top-1 bundle only to choose the same
+deterministic prompt cohort and its t=0 masked seed. From each identical seed,
+it runs a Fast-dLLM threshold=0.8 baseline and independent Exact VCCC
+rollouts for K=2,4,8.
 
-For each pool it forwards every subset context exactly once with
-`use_cache=False`, then checks every target under every subset of the other
-selected positions. The preserving extension can only return `B ∪ T`; if `B`
-itself fails, that is reported explicitly rather than converted to zero extra
-capacity. The free oracle is a separately labelled upper bound because it may
-drop a Fast-dLLM token. No candidate values, forced branches, learned score,
-or long-horizon rollout is part of this audit.
+At an Exact VCCC action step, it considers only still-masked generated
+positions. It ranks them by the fresh full-vocabulary probability gap
+p1-p2 (ties: physical position), uses the top min(K, remaining masks)
+as P_K, and keeps every candidate's current deterministic top-1 value
+fixed. It evaluates every subset context of P_K with an independent
+fixed-position use_cache=False forward. The actual commit set is the largest
+all-order-safe subset C_K within P_K; ties prefer the larger summed
+p1-p2, then physical positions. Thus, K bounds the exponential oracle
+search rather than forcing every top-K token to commit.
+
+The Fast-dLLM control follows the normal p1>=0.8 reveal rule plus the
+first-highest-confidence fallback when no position reaches threshold. The
+report distinguishes two Fast-dLLM measurements: its native collector-style
+`model(x, use_cache=True)` throughput (without past-key reuse) is the
+operational Fast-dLLM reference; a separate fixed-position `use_cache=False`
+Fast replay is retained as a controlled forward-convention diagnostic. The
+primary terminal-output agreement is reported against native Fast-dLLM as
+well as the separate matched replay diagnostic. The Exact VCCC throughput
+includes every subset forward. It does not treat action overlap after
+diverging trajectories as output agreement.
 
 Run it after pulling the commit containing this runner:
 
@@ -254,25 +273,30 @@ Run it after pulling the commit containing this runner:
 export PERSISTENT_ROOT=/workspace/zslee/code/candidate-attention
 cd "$PERSISTENT_ROOT/zslee/dllm_candidate_probe"
 
-# First check the artifact shape with one deterministic primary state.
+# First check the full protocol with one deterministic prompt.
 bash scripts/run_exact_top1_vccc_oracle_headroom.sh \
   outputs/top1_dynamics_audit/20260908T130232Z --smoke
 
-# Primary 100-prompt state audit.
+# Primary 100-prompt Exact VCCC rollout audit.
 bash scripts/run_exact_top1_vccc_oracle_headroom.sh \
   outputs/top1_dynamics_audit/20260908T130232Z
 ```
 
 The audit creates
 `outputs/vccc_oracle_audit/exact_top1_vccc_oracle_headroom_<timestamp>/`.
-Open `report.md` first. `tables/state_pool_selection.csv` records every source
-state/M eligibility decision; `tables/policy_state_results.csv` and
-`tables/token_certificate_witnesses.csv` contain exact certificates and query
-witnesses; `tables/headroom_summary.csv` contains prompt-clustered CIs; and
-`tables/matched_risk_test.csv` selects confidence thresholds only on hashed
-calibration prompts before reporting held-out test results. Exact verification
-forwards are reported separately from the idealized cheap-predictor NFE proxy,
-so the report makes no wall-clock speedup claim.
+Open report.md first. tables/throughput_summary.csv contains native Fast-dLLM
+throughput, separately labeled matched no-cache Fast throughput, and
+CUDA-synchronized Exact-VCCC verification-aware positions/s plus logical
+forward counts;
+tables/commit_batch_summary.csv records the requested actual commit-set sizes
+for Fast-dLLM and each K; and tables/final_output_agreement.csv compares each
+Exact-VCCC terminal generation with its same-prompt native Fast-dLLM result
+and, separately, the matched no-cache control.
+The raw policy/action table records the entire <=16-position p1-p2 ranking
+and the K/K+1 cutoff at every Exact action; scalar certificate contexts are
+appended together with policy actions, terminal rollouts, and agreement rows
+prompt-by-prompt under raw/. progress.json is atomically replaced after each
+completed prompt, so a long full run remains inspectable if interrupted.
 
 As with the other shared-GPU wrappers, it will not run alongside an existing
 compute process. Only when the sole process is this audit itself may the job

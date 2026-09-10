@@ -14,6 +14,7 @@ from src.exact_top1_headroom import (  # noqa: E402
     certificate_cache_for_gamma,
     choose_largest_safe_mask,
     exact_set_certificate,
+    select_top_probability_margin_positions,
 )
 
 
@@ -35,6 +36,81 @@ def _fully_safe_margins(size: int) -> dict[tuple[int, int], dict[str, object]]:
 
 
 class ExactTop1HeadroomTest(unittest.TestCase):
+    def test_top_probability_margin_pool_uses_p1_minus_p2_not_confidence_or_logit_margin(self) -> None:
+        # Mapping insertion order, p1, and raw-logit margins deliberately
+        # disagree with the requested p1-p2 probability-margin ranking.
+        assignments = {
+            27: {"top1_probability": 0.99, "top2_probability": 0.75, "logit_margin": 9.0},
+            8: {"top1_probability": 0.75, "top2_probability": 0.25, "logit_margin": 0.1},
+            4: {"top1_probability": 0.625, "top2_probability": 0.125, "logit_margin": 0.2},
+            16: {"top1_probability": 0.93, "top2_probability": 0.48, "logit_margin": 8.0},
+        }
+
+        # Positions 4 and 8 have the same highest probability margin; the
+        # physical-position rule resolves that tie, independent of input order.
+        self.assertEqual(select_top_probability_margin_positions(assignments, 2), (4, 8))
+        self.assertEqual(select_top_probability_margin_positions(assignments, 8), (4, 8, 16, 27))
+
+    def test_exact_oracle_drops_from_failing_full_top_k_to_maximal_safe_subset(self) -> None:
+        # The full K=3 candidate set fails only for target 2 after candidate
+        # 0 is revealed.  A valid exact oracle must search subsets, rather
+        # than commit all three or collapse unnecessarily to the empty set.
+        margins = _fully_safe_margins(3)
+        margins[(2, 0b001)] = _row(-0.2, match=False)
+        certificates = certificate_cache_for_gamma(margins, 3, 0.0)
+
+        self.assertFalse(certificates[0b111].passes)
+        chosen = choose_largest_safe_mask(
+            certificates,
+            probabilities=(0.95, 0.80, 0.93),
+            positions=(4, 8, 16),
+            tie_scores=(0.10, 0.10, 0.80),
+        )
+        # {1,2} is safe and has cardinality two; it beats {0,1} on summed
+        # p1-p2 margin (.90 vs .20) and therefore becomes C_K.
+        self.assertEqual(chosen, 0b110)
+        self.assertEqual(int(chosen or 0).bit_count(), 2)
+        self.assertTrue(certificates[int(chosen or 0)].passes)
+
+    def test_exact_oracle_tie_scores_override_legacy_log_p1_only_when_requested(self) -> None:
+        certificates = certificate_cache_for_gamma(_fully_safe_margins(3), 3, 0.0)
+        pair_candidates = {
+            0b011: certificates[0b011],
+            0b101: certificates[0b101],
+        }
+
+        # The default preserves the older headroom policy's summed-log-p1
+        # ranking, while the new rollout oracle explicitly supplies p1-p2
+        # scores for its candidate-set tie-break.
+        self.assertEqual(
+            choose_largest_safe_mask(
+                pair_candidates,
+                probabilities=(0.95, 0.90, 0.55),
+                positions=(10, 20, 30),
+            ),
+            0b011,
+        )
+        self.assertEqual(
+            choose_largest_safe_mask(
+                pair_candidates,
+                probabilities=(0.95, 0.90, 0.55),
+                positions=(10, 20, 30),
+                tie_scores=(0.10, 0.10, 0.80),
+            ),
+            0b101,
+        )
+        # Equal summed p1-p2 scores must still end with physical position
+        # order, not the arbitrary dictionary/mask iteration order.
+        self.assertEqual(
+            choose_largest_safe_mask(
+                pair_candidates,
+                probabilities=(0.95, 0.90, 0.55),
+                positions=(10, 20, 30),
+                tie_scores=(0.80, 0.40, 0.40),
+            ),
+            0b011,
+        )
+
     def test_certificate_checks_every_subset_not_only_final_leave_one_out(self) -> None:
         # The only unsafe query is an *intermediate* context for target 2.
         # Its final LOO context (revealed=0b011) remains safe, so an

@@ -1,5 +1,8 @@
-# Exact all-order current-top1 VCCC headroom audit.  This is a read-only
-# continuation of a completed primary top1_dynamics_audit trajectory bundle.
+# Experiment 3: exact all-order VCCC oracle checking.
+#
+# The source run supplies a deterministic primary prompt cohort and model
+# provenance. Every policy below is freshly rolled out from the same t=0
+# generated-mask seed; archived .9 actions are never used as the .8 baseline.
 model:
   name: GSAI-ML/LLaDA-8B-Instruct
   fast_dllm_repo: https://github.com/NVlabs/Fast-dLLM.git
@@ -8,58 +11,49 @@ model:
   dtype: auto
 
 decoding:
-  # Retained for reproducible frozen-model loading.  No trajectory is sampled
-  # or policy is altered by this audit.
+  # Required by the shared frozen-model loader. No stochastic sampling is
+  # used after the source t=0 seed is selected.
   seed: 20260902
-  threshold: 0.9
+  generation_length: 16
+  max_steps: 16
 
-decoder_policy:
-  # B_t comes from these already-recorded normal actions; it is never
-  # recomputed from a fresh exact replay.
-  required_name: confidence_ge_threshold_plus_argmax_fallback
-  threshold_rule: p1_ge_threshold
-  fallback_rule: force_highest_confidence_position_when_none_reach_threshold
-
-sampling:
-  # One outcome-blind deterministic state per primary prompt.  The primary
-  # sample remains prompt-disjoint by construction; hard is off by default
-  # and would be reported separately if deliberately enabled.
+source:
+  required_primary_threshold: 0.9
+  required_decoder_policy: confidence_ge_threshold_plus_argmax_fallback
+  # These reproduce the former headroom audit's outcome-blind prompt cohort,
+  # then the new experiment replays each selected prompt from its t=0 state.
+  state_selection_salt: headroom-primary-state
+  prompt_selection_salt: headroom-primary-prompt
   primary_prompt_cap: 100
-  hard_exploratory_prompt_cap: 0
-  pool_sizes: [4, 6, 8]
-  # gamma=0 retains the exact top-1 preservation test; positive values are
-  # raw-logit-margin sensitivity analyses, never merged with gamma=0.
-  margin_thresholds: [0.0, 0.25, 0.5, 1.0]
-  # This deliberately has no fallback, so it is a confidence frontier rather
-  # than a hidden duplicate of the actual Fast-dLLM policy.
-  confidence_thresholds: [0.0, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 0.99]
-  clustered_bootstrap_replicates: 10000
-  bootstrap_seed: 20260910
 
-certificate:
-  # Threshold comparison is inclusive. Deterministic full-vocabulary argmax
-  # must still equal y_i, which makes ties explicit even at gamma=0.
+fast_dllm_baseline:
+  threshold: 0.8
+  fallback_rule: force_first_highest_confidence_position_when_none_reach_threshold
+  # Native measures the historical collector-style Fast-dLLM call. The
+  # no-cache matched replay exists only for a controlled output comparison.
+  native_throughput_cache_policy: use_cache_true_without_past_key_values_reuse
+  matched_agreement_cache_policy: use_cache_false
+
+exact_vccc_oracle:
+  candidate_sizes: [2, 4, 8]
+  candidate_rank: probability_p1_minus_p2_descending_then_physical_position
+  # The top-K pool is searched exhaustively. The action is the largest
+  # all-order-safe subset, with summed p1-p2 then physical-position ties.
+  selected_set_rule: max_cardinality_then_sum_probability_margin_then_physical_position
+  margin_threshold: 0.0
   tie_tolerance: 1.0e-7
 
 execution:
-  subset_batch_size: 8
+  # Exact VCCC and its matched Fast control use fixed-position no-cache
+  # forwards. Native Fast-dLLM throughput is reported separately above.
   exact_measurement_cache_policy: use_cache_false
-  random_seed_namespace: exact-top1-vccc-oracle-headroom-v1
+  subset_batch_size: 8
+  random_seed_namespace: exact-top1-vccc-oracle-checking-v1
 
-matching:
-  # Confidence tau is picked only on these hashed calibration prompts and is
-  # evaluated on the disjoint held-out prompts. No learned predictor is used.
-  prompt_split_salt: exact-top1-vccc-oracle-headroom-v1
-  calibration_percent: 50
-  risk_units: [batch_failure, token_violation]
-  risk_budgets: [0.0, 0.05]
-  # The core decision uses a held-out paired capacity delta at this exact-risk
-  # point, rather than deciding from the oracle's in-sample capacity alone.
-  core_risk_unit: batch_failure
-  core_risk_budget: 0.0
+reporting:
+  clustered_bootstrap_replicates: 10000
+  bootstrap_seed: 20260911
 
 storage:
-  # Retain the previous VCCC output parent while giving this independent audit
-  # an unambiguous timestamped child directory.
   output_root: outputs/vccc_oracle_audit
   run_prefix: exact_top1_vccc_oracle_headroom_

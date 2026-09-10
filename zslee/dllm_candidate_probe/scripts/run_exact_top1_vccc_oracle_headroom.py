@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""Exact all-order top-1 VCCC headroom audit.
+"""Experiment 3: exact all-order VCCC oracle checking.
 
-This is a read-only continuation of a completed Fast-dLLM top-1 trajectory
-audit.  It asks one deliberately narrow question: with the *current exact
-top-1 token values fixed*, can an exhaustive all-order certificate extend the
-batch that the unchanged confidence-plus-fallback Fast-dLLM policy committed?
+This offline experiment starts every policy from an identical archived t=0
+prompt seed. At each exact-oracle state, it ranks only still-masked generation
+positions by the fresh FP32 probability gap p1-p2, takes the top-K candidate
+pool (K=2, 4, 8), and exhaustively checks every subset context with a
+full-vocabulary no-cache forward. The action is the maximum-cardinality
+all-order-safe subset of that pool, not an unconditional top-K commit.
 
-The runner never changes a decoder trajectory, proposes alternative token
-values, trains a predictor, or claims that the exponential verification work
-is a deployable speedup.  Each branch is an independent full-vocabulary,
-``use_cache=False`` forward over a fixed-length state.
+The comparator is the normal Fast-dLLM threshold-plus-fallback action at
+threshold 0.8. Its native collector-style ``use_cache=True`` rollout is timed
+as the operational Fast-dLLM reference. A second, no-cache matched rollout is
+used only for a controlled final-output comparison with the oracle. The
+oracle's exponential subset forwards are included in its wall-clock timing
+and separately counted; this is an offline oracle, not a deployable speed
+claim.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -32,57 +38,127 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.run_vccc_oracle_audit import (  # noqa: E402
+from scripts.run_vccc_oracle_audit import (
     exact_logits_batched,
     margin_summary,
     read_jsonl,
     stable_key,
 )
-from src.exact_top1_headroom import (  # noqa: E402
-    SetCertificate,
+from src.exact_top1_headroom import (
     certificate_cache_for_gamma,
     choose_largest_safe_mask,
-    confidence_selected_mask,
-    first_target_failure,
     mask_indices,
+    select_top_probability_margin_positions,
 )
-from src.top1_reporting import prompt_clustered_bootstrap, write_csv, write_jsonl  # noqa: E402
+from src.top1_reporting import prompt_clustered_bootstrap, write_csv, write_jsonl
 
 
-SCHEMA_VERSION = 1
-POLICY_FAST = "fast_dllm_actual"
-POLICY_EXTENSION = "fast_dllm_preserving_exact_extension"
-POLICY_FREE = "free_exact_vccc_upper_bound"
-POLICY_CONFIDENCE = "confidence_only_threshold"
+SCHEMA_VERSION = 4
+# The matched control is the output-agreement reference. The native control
+# mirrors the historical collector's direct use_cache=True invocation for the
+# separately reported operational Fast-dLLM throughput.
+FAST_POLICY = "fast_dllm_threshold_0p8_exact_matched"
+NATIVE_FAST_POLICY = "fast_dllm_threshold_0p8_native"
+EXACT_POLICY = "exact_top1_vccc_oracle"
+MATCHED_FAST_FORWARD_CONVENTION = "fixed_position_full_vocabulary_use_cache_false"
+NATIVE_FAST_FORWARD_CONVENTION = "historical_fast_dllm_direct_model_use_cache_true_without_past_key_reuse"
+EXACT_FORWARD_CONVENTION = "every_candidate_subset_uses_fixed_position_full_vocabulary_use_cache_false"
 
 
 @dataclass(frozen=True)
-class SelectedState:
-    """Outcome-blind source state retained for fresh exact verification."""
+class PromptSeed:
+    """One deterministic t=0 replay seed from the completed source audit."""
 
-    record: Mapping[str, Any]
-    cohort: str
-    selection_reason: str
-    prompt_partition: str
+    prompt_id: str
+    dataset: str | None
+    example_id: str | None
+    source_representative_state_key: str
+    source_t0_state_key: str
+    token_sequence: tuple[int, ...]
+    generation_length: int
+    source_t0_top1_token_ids: tuple[tuple[int, int], ...]
+
+    @property
+    def generation_start(self) -> int:
+        return len(self.token_sequence) - int(self.generation_length)
+
+    @property
+    def generation_positions(self) -> tuple[int, ...]:
+        return tuple(range(self.generation_start, len(self.token_sequence)))
 
 
 @dataclass
 class ForwardAccounting:
-    """Keep verification work separate from any idealized NFE proxy."""
+    """Per-rollout logical forwards and physical model batch calls."""
 
-    base_forwards: int = 0
+    action_forwards: int = 0
     subset_context_forwards: int = 0
     model_batch_calls: int = 0
-    started: float = 0.0
+    failed_model_batch_calls: int = 0
+    subset_oom_retries: int = 0
+    smallest_successful_subset_batch_size: int | None = None
+    policy_action_steps: int = 0
+    committed_tokens: int = 0
 
     @property
-    def exact_forwards(self) -> int:
-        return int(self.base_forwards + self.subset_context_forwards)
+    def model_forward_evaluations(self) -> int:
+        return int(self.action_forwards + self.subset_context_forwards)
+
+
+@dataclass
+class RolloutResult:
+    """Terminal policy result plus serializable step-level evidence."""
+
+    prompt_id: str
+    dataset: str | None
+    example_id: str | None
+    policy: str
+    candidate_k: int | None
+    forward_convention: str
+    completed: bool
+    terminal_status: str
+    final_generation_token_ids: tuple[int, ...]
+    wall_seconds: float
+    accounting: ForwardAccounting
+    step_rows: list[dict[str, Any]]
+    context_rows: list[dict[str, Any]]
+    query_rows: list[dict[str, Any]]
+
+    def prompt_row(self) -> dict[str, Any]:
+        return {
+            "prompt_id": self.prompt_id,
+            "dataset": self.dataset,
+            "example_id": self.example_id,
+            "policy": self.policy,
+            "candidate_k": self.candidate_k,
+            "forward_convention": self.forward_convention,
+            "completed": self.completed,
+            "terminal_status": self.terminal_status,
+            "final_generation_token_ids": list(self.final_generation_token_ids),
+            "final_generation_sha256": hashlib.sha256(
+                ",".join(str(value) for value in self.final_generation_token_ids).encode("utf-8")
+            ).hexdigest(),
+            "generation_length": len(self.final_generation_token_ids),
+            "wall_seconds": self.wall_seconds,
+            "verification_aware_throughput_tokens_per_second": (
+                self.accounting.committed_tokens / self.wall_seconds if self.wall_seconds > 0.0 else None
+            ),
+            **asdict(self.accounting),
+            "model_forward_evaluations": self.accounting.model_forward_evaluations,
+            "exact_forward_evaluations": (
+                self.accounting.model_forward_evaluations
+                if "use_cache_false" in self.forward_convention
+                else None
+            ),
+            "mean_commits_per_action_step": (
+                self.accounting.committed_tokens / self.accounting.policy_action_steps
+                if self.accounting.policy_action_steps
+                else None
+            ),
+        }
 
 
 def _json_safe(value: Any) -> Any:
-    """Convert audit metadata to strict portable JSON without numpy imports."""
-
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
@@ -105,6 +181,32 @@ def write_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(_json_safe(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def write_json_atomic(path: Path, value: Any) -> None:
+    """Atomically replace a small progress record on the persistent volume."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(_json_safe(value), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+
+
+def append_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> int:
+    """Append durable JSONL evidence without retaining every prompt in RAM."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with path.open("a", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(_json_safe(dict(row)), ensure_ascii=False, sort_keys=True) + "\n")
+            count += 1
+        handle.flush()
+        os.fsync(handle.fileno())
+    return count
+
+
 def _finite_float(value: Any) -> float | None:
     try:
         result = float(value)
@@ -113,760 +215,911 @@ def _finite_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _source_common(state: SelectedState) -> dict[str, Any]:
-    record = state.record
-    return {
-        "state_key": str(record.get("state_key")),
-        "cohort": state.cohort,
-        "selection_reason": state.selection_reason,
-        "prompt_partition": state.prompt_partition,
-        "dataset": record.get("dataset"),
-        "prompt_id": record.get("prompt_id"),
-        "prompt_index": record.get("prompt_index"),
-        "source_step": record.get("step"),
-        "generated_mask_ratio": record.get("generated_mask_ratio"),
-        "sequence_length": len(record.get("token_sequence", ())),
-        "source_threshold": record.get("threshold"),
-    }
+def _sync_cuda(torch: Any) -> None:
+    if bool(torch.cuda.is_available()):
+        torch.cuda.synchronize()
 
 
-def prompt_partition(prompt_id: str, config: Mapping[str, Any]) -> str:
-    """Fixed prompt-disjoint calibration/test split, retained in raw outputs."""
+def _source_record_error(record: Mapping[str, Any], config: Mapping[str, Any]) -> str | None:
+    """Check source provenance before prompt selection, without outcomes."""
 
-    split = config["matching"]
-    calibration_percent = int(split["calibration_percent"])
-    if not 1 <= calibration_percent <= 99:
-        raise ValueError("matching.calibration_percent must be between 1 and 99")
-    bucket = int(stable_key(str(split["prompt_split_salt"]), str(prompt_id))[:8], 16) % 100
-    return "calibration" if bucket < calibration_percent else "test"
-
-
-def _basic_source_error(record: Mapping[str, Any], config: Mapping[str, Any]) -> str | None:
-    """Validate fields needed before an outcome-blind state can be sampled."""
-
-    required = ("state_key", "prompt_id", "token_sequence", "mask_positions", "actual_committed_anchors")
+    required = ("state_key", "prompt_id", "step", "token_sequence", "generation_length", "measurement")
     if any(field not in record for field in required):
         return "missing_required_source_field"
-    if not isinstance(record.get("token_sequence"), Sequence) or isinstance(record.get("token_sequence"), (str, bytes)):
-        return "invalid_token_sequence"
-    if not isinstance(record.get("mask_positions"), Sequence) or isinstance(record.get("mask_positions"), (str, bytes)):
-        return "invalid_mask_positions"
-    if not isinstance(record.get("actual_committed_anchors"), list):
-        return "invalid_actual_batch"
     if record.get("measurement") != "exact_no_cache":
-        return "source_state_is_not_declared_exact_no_cache_measurement"
+        return "source_t0_is_not_exact_no_cache_measurement"
+    if not isinstance(record.get("token_sequence"), Sequence) or isinstance(record.get("token_sequence"), (str, bytes)):
+        return "invalid_source_token_sequence"
+    if _finite_float(record.get("generation_length")) is None or int(record["generation_length"]) < 1:
+        return "invalid_source_generation_length"
     metadata = record.get("decoder_metadata")
-    if not isinstance(metadata, Mapping) or metadata.get("natural_policy") != config["decoder_policy"]["required_name"]:
-        return "missing_or_unexpected_decoder_policy_provenance"
+    expected_policy = str(config["source"]["required_decoder_policy"])
+    if not isinstance(metadata, Mapping) or metadata.get("natural_policy") != expected_policy:
+        return "missing_or_unexpected_source_decoder_policy"
     if metadata.get("exact_measurement_use_cache") is not False:
-        return "source_state_missing_exact_no_cache_measurement_provenance"
+        return "source_missing_exact_no_cache_provenance"
     return None
 
 
-def natural_policy_rows_by_state(path: Path) -> dict[str, dict[int, Mapping[str, Any]]]:
-    """Load the original-policy scalars needed to verify B without replaying it.
+def _source_t0_top1_ids(
+    record: Mapping[str, Any], *, generation_start: int, generation_length: int
+) -> tuple[tuple[int, int], ...] | None:
+    """Recover archived exact t=0 top-1 values for fail-closed replay checks."""
 
-    `trajectories.jsonl` deliberately holds exact no-cache position summaries,
-    while the natural batch action was made from the original collector's
-    distributions.  The source audit saves both in `state_positions.jsonl`;
-    use those natural fields to validate the historic action rather than
-    silently replacing it with this audit's fresh exact forward.
-    """
-
-    if not path.exists():
-        raise FileNotFoundError(
-            "Source run lacks raw/state_positions.jsonl, which is required to verify the recorded normal Fast-dLLM batch."
-        )
-    grouped: dict[str, dict[int, Mapping[str, Any]]] = defaultdict(dict)
-    for row in read_jsonl(path):
+    summaries = record.get("position_summaries")
+    if not isinstance(summaries, Mapping):
+        return None
+    result: list[tuple[int, int]] = []
+    for position in range(int(generation_start), int(generation_start) + int(generation_length)):
+        summary = summaries.get(str(position))
+        if not isinstance(summary, Mapping):
+            return None
         try:
-            state_key = str(row["state_key"])
-            position = int(row["position"])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"Malformed natural-policy source row in {path}: {row!r}") from error
-        if position in grouped[state_key]:
-            raise ValueError(f"Duplicate source position evidence for state={state_key!r}, position={position}")
-        grouped[state_key][position] = row
-    return dict(grouped)
+            token_id = int(summary["top1_token_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        result.append((position, token_id))
+    return tuple(result)
 
 
-def select_states(
-    trajectories: Sequence[Mapping[str, Any]], config: Mapping[str, Any], *, smoke: bool
-) -> tuple[list[SelectedState], list[dict[str, Any]], dict[str, int]]:
-    """Pick prompt-diverse states before any fresh exact forward is observed.
+def _source_t0_ambiguous_tie_positions(
+    record: Mapping[str, Any], *, generation_start: int, generation_length: int, tie_tolerance: float
+) -> list[int] | None:
+    """Find source top-k ties whose stored top-1 is not an argmax guarantee."""
 
-    The primary sample uses at most one deterministically hashed state per
-    prompt.  This prevents a long trajectory from dominating the primary
-    cohort and makes the reported prompt-clustered CI especially transparent.
-    No certificate, flip, margin, or base-batch-size outcome participates in
-    selection.
-    """
+    summaries = record.get("position_summaries")
+    if not isinstance(summaries, Mapping):
+        return None
+    tied: list[int] = []
+    for position in range(int(generation_start), int(generation_start) + int(generation_length)):
+        summary = summaries.get(str(position))
+        if not isinstance(summary, Mapping):
+            return None
+        margin = _finite_float(summary.get("logit_margin"))
+        if margin is None:
+            return None
+        if abs(margin) <= float(tie_tolerance):
+            tied.append(position)
+    return tied
 
-    sampling = config["sampling"]
-    threshold = float(config["decoding"]["threshold"])
-    candidate_by_prompt: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+
+def select_prompt_seeds(
+    trajectories: Sequence[Mapping[str, Any]],
+    config: Mapping[str, Any],
+    *,
+    smoke: bool,
+) -> tuple[list[PromptSeed], list[dict[str, Any]], dict[str, int]]:
+    """Reuse the prior deterministic prompt set, then take each t=0 seed."""
+
+    threshold = float(config["source"]["required_primary_threshold"])
+    grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     screening: list[dict[str, Any]] = []
     counts: Counter[str] = Counter()
     for record in trajectories:
         if record.get("setting") != "primary" or _finite_float(record.get("threshold")) != threshold:
             continue
         counts["source_primary_state_rows"] += 1
-        error = _basic_source_error(record, config)
-        base = {
-            "state_key": record.get("state_key"),
+        error = _source_record_error(record, config)
+        common = {
             "prompt_id": record.get("prompt_id"),
             "dataset": record.get("dataset"),
+            "example_id": record.get("example_id"),
+            "state_key": record.get("state_key"),
             "source_step": record.get("step"),
-            "cohort": "primary",
-            "selection_stage": "outcome_blind_source_screen",
+            "selection_stage": "outcome_blind_prompt_seed_screen",
         }
         if error is not None:
-            screening.append({**base, "status": "excluded_before_selection", "exclusion_reason": error})
+            screening.append({**common, "status": "excluded_before_selection", "exclusion_reason": error})
             counts[f"excluded_{error}"] += 1
             continue
-        candidate_by_prompt[str(record["prompt_id"])].append(record)
+        grouped[str(record["prompt_id"])].append(record)
 
-    prompt_representatives: list[Mapping[str, Any]] = []
-    for prompt_id, records in candidate_by_prompt.items():
-        representative = min(records, key=lambda row: stable_key("headroom-primary-state", prompt_id, row["state_key"]))
-        prompt_representatives.append(representative)
-        for record in records:
-            if record is not representative:
-                screening.append({
-                    "state_key": record["state_key"],
-                    "prompt_id": record["prompt_id"],
-                    "dataset": record.get("dataset"),
-                    "source_step": record.get("step"),
-                    "cohort": "primary",
-                    "selection_stage": "outcome_blind_source_screen",
-                    "status": "not_selected_other_state_for_same_prompt",
-                    "exclusion_reason": None,
-                })
+    representatives: list[Mapping[str, Any]] = []
+    state_selection_salt = str(config["source"]["state_selection_salt"])
+    prompt_selection_salt = str(config["source"]["prompt_selection_salt"])
+    for prompt_id, rows in grouped.items():
+        representative = min(rows, key=lambda row: stable_key(state_selection_salt, prompt_id, row["state_key"]))
+        representatives.append(representative)
+    representatives.sort(
+        key=lambda row: stable_key(prompt_selection_salt, row["prompt_id"], row["state_key"])
+    )
+    cap = 1 if smoke else int(config["source"]["primary_prompt_cap"])
+    chosen = representatives[:cap]
+    counts["source_primary_prompt_count"] = len(grouped)
+    counts["selected_prompt_count_before_t0_validation"] = len(chosen)
 
-    prompt_representatives.sort(key=lambda row: stable_key("headroom-primary-prompt", row["prompt_id"], row["state_key"]))
-    primary_cap = 1 if smoke else int(sampling["primary_prompt_cap"])
-    hard_cap = 0 if smoke else int(sampling.get("hard_exploratory_prompt_cap", 0))
-    primary_records = prompt_representatives[:primary_cap]
-    hard_records = prompt_representatives[primary_cap : primary_cap + hard_cap]
-    selected: list[SelectedState] = []
-    selected_ids: set[str] = set()
-    for cohort, reason, records in (
-        ("primary", "deterministic_one_state_per_prompt", primary_records),
-        ("hard_exploratory", "deterministic_remaining_prompt_sample", hard_records),
-    ):
-        for record in records:
-            selected_ids.add(str(record["state_key"]))
-            partition = prompt_partition(str(record["prompt_id"]), config)
-            selected.append(SelectedState(record, cohort, reason, partition))
+    seeds: list[PromptSeed] = []
+    chosen_ids = {str(row["prompt_id"]) for row in chosen}
+    for representative in chosen:
+        prompt_id = str(representative["prompt_id"])
+        t0_rows = [row for row in grouped[prompt_id] if int(row.get("step", -1)) == 0]
+        common = {
+            "prompt_id": prompt_id,
+            "dataset": representative.get("dataset"),
+            "example_id": representative.get("example_id"),
+            "state_key": representative.get("state_key"),
+            "source_step": representative.get("step"),
+            "selection_stage": "t0_seed_resolution",
+        }
+        if len(t0_rows) != 1:
+            reason = "missing_t0_source_state" if not t0_rows else "duplicate_t0_source_states"
+            screening.append({**common, "status": "excluded_after_selection", "exclusion_reason": reason})
+            counts[f"excluded_{reason}"] += 1
+            continue
+        t0 = t0_rows[0]
+        try:
+            token_sequence = tuple(int(value) for value in t0["token_sequence"])
+            generation_length = int(t0["generation_length"])
+        except (KeyError, TypeError, ValueError):
             screening.append({
-                "state_key": record["state_key"],
-                "prompt_id": record["prompt_id"],
-                "dataset": record.get("dataset"),
-                "source_step": record.get("step"),
-                "cohort": cohort,
-                "prompt_partition": partition,
-                "selection_stage": "outcome_blind_source_screen",
-                "status": "selected_pending_fresh_exact_replay",
-                "exclusion_reason": None,
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "invalid_t0_token_sequence_or_generation_length",
             })
-    for record in prompt_representatives[primary_cap + hard_cap :]:
-        if str(record["state_key"]) not in selected_ids:
+            counts["excluded_invalid_t0_token_sequence_or_generation_length"] += 1
+            continue
+        if len(token_sequence) <= generation_length:
             screening.append({
-                "state_key": record["state_key"],
-                "prompt_id": record["prompt_id"],
-                "dataset": record.get("dataset"),
-                "source_step": record.get("step"),
-                "cohort": "not_selected",
-                "selection_stage": "outcome_blind_source_screen",
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "t0_generation_length_not_shorter_than_sequence",
+            })
+            counts["excluded_t0_generation_length_not_shorter_than_sequence"] += 1
+            continue
+        configured_length = int(config["decoding"]["generation_length"])
+        if generation_length != configured_length:
+            screening.append({
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "t0_generation_length_differs_from_config",
+                "source_generation_length": generation_length,
+                "configured_generation_length": configured_length,
+            })
+            counts["excluded_t0_generation_length_differs_from_config"] += 1
+            continue
+        t0_top1_ids = _source_t0_top1_ids(
+            t0,
+            generation_start=len(token_sequence) - generation_length,
+            generation_length=generation_length,
+        )
+        if t0_top1_ids is None:
+            screening.append({
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "missing_t0_exact_position_summaries",
+            })
+            counts["excluded_missing_t0_exact_position_summaries"] += 1
+            continue
+        source_ties = _source_t0_ambiguous_tie_positions(
+            t0,
+            generation_start=len(token_sequence) - generation_length,
+            generation_length=generation_length,
+            tie_tolerance=float(config["exact_vccc_oracle"]["tie_tolerance"]),
+        )
+        if source_ties is None:
+            screening.append({
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "missing_t0_exact_logit_margin",
+            })
+            counts["excluded_missing_t0_exact_logit_margin"] += 1
+            continue
+        if source_ties:
+            screening.append({
+                **common,
+                "status": "excluded_after_selection",
+                "exclusion_reason": "ambiguous_t0_source_top1_logit_tie",
+                "ambiguous_t0_positions": source_ties,
+            })
+            counts["excluded_ambiguous_t0_source_top1_logit_tie"] += 1
+            continue
+        seed = PromptSeed(
+            prompt_id=prompt_id,
+            dataset=None if t0.get("dataset") is None else str(t0.get("dataset")),
+            example_id=None if t0.get("example_id") is None else str(t0.get("example_id")),
+            source_representative_state_key=str(representative["state_key"]),
+            source_t0_state_key=str(t0["state_key"]),
+            token_sequence=token_sequence,
+            generation_length=generation_length,
+            source_t0_top1_token_ids=t0_top1_ids,
+        )
+        seeds.append(seed)
+        screening.append({
+            **common,
+            "source_t0_state_key": seed.source_t0_state_key,
+            "status": "selected_t0_seed_pending_mask_validation",
+            "exclusion_reason": None,
+        })
+    for representative in representatives[cap:]:
+        if str(representative["prompt_id"]) not in chosen_ids:
+            screening.append({
+                "prompt_id": representative.get("prompt_id"),
+                "dataset": representative.get("dataset"),
+                "example_id": representative.get("example_id"),
+                "state_key": representative.get("state_key"),
+                "source_step": representative.get("step"),
+                "selection_stage": "outcome_blind_prompt_seed_screen",
                 "status": "not_selected_prompt_cap",
                 "exclusion_reason": None,
             })
-    counts["source_primary_prompt_count"] = len(candidate_by_prompt)
-    counts["selected_primary_state_count"] = len(primary_records)
-    counts["selected_hard_state_count"] = len(hard_records)
-    return selected, screening, dict(counts)
+    counts["selected_t0_seed_count"] = len(seeds)
+    return seeds, screening, dict(counts)
 
 
-def _validate_actual_batch(
-    state: SelectedState,
+def _check_source_manifest(manifest: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    status = str(manifest.get("status", ""))
+    if not status.startswith("completed"):
+        raise RuntimeError(f"Source top-1 run must be completed; observed status={status!r}")
+    expected_commit = str(config["model"]["fast_dllm_commit"])
+    source_commit = manifest.get("fast_dllm_requested_commit")
+    if source_commit is not None and str(source_commit) != expected_commit:
+        raise RuntimeError(
+            f"Source Fast-dLLM commit mismatch: expected {expected_commit!r}, observed {source_commit!r}"
+        )
+    source_snapshot = manifest.get("model_snapshot")
+    if not isinstance(source_snapshot, Mapping):
+        raise RuntimeError("Source run lacks model_snapshot provenance required for a frozen replay.")
+    for field, expected in (
+        ("model_name", config["model"]["name"]),
+        ("requested_hf_revision", config["model"]["hf_revision"]),
+    ):
+        observed = source_snapshot.get(field)
+        if observed is not None and str(observed) != str(expected):
+            raise RuntimeError(
+                f"Source model provenance mismatch for {field}: expected {expected!r}, observed {observed!r}"
+            )
+
+
+def _validate_t0_masks(seed: PromptSeed, *, mask_token_id: int) -> str | None:
+    invalid = [
+        position
+        for position in seed.generation_positions
+        if int(seed.token_sequence[position]) != int(mask_token_id)
+    ]
+    if invalid:
+        return f"t0_generation_positions_not_masked:{invalid}"
+    return None
+
+
+def _active_generation_positions(input_ids: Any, seed: PromptSeed, *, mask_token_id: int) -> list[int]:
+    return [
+        position
+        for position in seed.generation_positions
+        if int(input_ids[0, position].item()) == int(mask_token_id)
+    ]
+
+
+def _base_assignments(
+    logits: Any,
+    positions: Iterable[int],
     *,
-    mask_positions: set[int],
-    mask_positions_in_policy_order: Sequence[int],
-    fresh_assignments: Mapping[int, Mapping[str, Any]],
-    natural_position_rows: Mapping[int, Mapping[str, Any]] | None,
-    config: Mapping[str, Any],
-) -> tuple[list[int] | None, str | None]:
-    """Validate and preserve, rather than recompute, the natural policy batch."""
-
-    record = state.record
-    if natural_position_rows is None:
-        return None, "missing_original_policy_position_evidence"
-    anchors = record.get("actual_committed_anchors")
-    if not isinstance(anchors, list) or not anchors:
-        return None, "missing_or_empty_actual_fast_dllm_batch"
-    threshold = float(config["decoding"]["threshold"])
-    positions: list[int] = []
-    fallback_count = 0
-    threshold_count = 0
-    anchor_by_position: dict[int, Mapping[str, Any]] = {}
-    for anchor in anchors:
-        if not isinstance(anchor, Mapping):
-            return None, "invalid_actual_batch_anchor"
-        try:
-            position = int(anchor["position"])
-            token_id = int(anchor["token_id"])
-            confidence = float(anchor["confidence"])
-        except (KeyError, TypeError, ValueError):
-            return None, "invalid_actual_batch_anchor_fields"
-        if position not in mask_positions:
-            return None, "actual_batch_position_not_masked"
-        if position in positions:
-            return None, "duplicate_actual_batch_position"
-        if not math.isfinite(confidence):
-            return None, "invalid_actual_batch_confidence"
-        eligible = bool(anchor.get("threshold_eligible"))
-        fallback = bool(anchor.get("selected_by_fallback"))
-        if eligible != (confidence >= threshold):
-            return None, "stored_actual_batch_threshold_metadata_mismatch"
-        if fallback:
-            fallback_count += 1
-        if eligible:
-            threshold_count += 1
-        if int(fresh_assignments[position]["token_id"]) != token_id:
-            return None, "stored_actual_batch_token_differs_from_fresh_exact_top1"
-        natural = natural_position_rows.get(position)
-        try:
-            natural_token = int(natural["natural_top1_token_id"]) if natural is not None else None
-            natural_confidence = float(natural["natural_top1_probability"]) if natural is not None else None
-        except (KeyError, TypeError, ValueError):
-            natural_token = natural_confidence = None
-        if natural_token != token_id or natural_confidence is None or not math.isfinite(natural_confidence):
-            return None, "actual_batch_anchor_disagrees_with_original_policy_position_evidence"
-        if abs(confidence - natural_confidence) > 2.0e-6:
-            return None, "actual_batch_anchor_confidence_disagrees_with_original_policy_evidence"
-        positions.append(position)
-        anchor_by_position[position] = anchor
-    if fallback_count > 1:
-        return None, "multiple_actual_batch_fallback_tokens"
-    if fallback_count and (threshold_count or len(positions) != 1):
-        return None, "invalid_actual_batch_fallback_semantics"
-    if not fallback_count and threshold_count != len(positions):
-        return None, "nonthreshold_actual_batch_token_without_fallback"
-    natural_values: list[tuple[int, int | None, float]] = []
-    for position in mask_positions_in_policy_order:
-        if position not in mask_positions:
-            return None, "invalid_original_policy_mask_position_order"
-        natural = natural_position_rows.get(int(position))
-        try:
-            natural_values.append((
-                int(position),
-                int(natural["natural_top1_token_id"]) if natural is not None else None,
-                float(natural["natural_top1_probability"]) if natural is not None else math.nan,
-            ))
-        except (KeyError, TypeError, ValueError):
-            return None, "missing_original_policy_position_evidence"
-    if {position for position, _token, _confidence in natural_values} != mask_positions:
-        return None, "incomplete_original_policy_position_evidence"
-    if any(token is None or not math.isfinite(confidence) for _position, token, confidence in natural_values):
-        return None, "invalid_original_policy_position_evidence"
-    threshold_positions = [position for position, _token, confidence in natural_values if confidence >= threshold]
-    if threshold_positions:
-        expected_positions = sorted(threshold_positions)
-        if fallback_count != 0 or threshold_count != len(positions):
-            return None, "actual_batch_disagrees_with_original_threshold_action"
-    else:
-        # `torch.argmax` returns the first maximum in the collector's masked
-        # position order.  Preserve that order explicitly for exact tie replay.
-        best_position = natural_values[0][0]
-        best_confidence = natural_values[0][2]
-        for position, _token, confidence in natural_values[1:]:
-            if confidence > best_confidence:
-                best_position, best_confidence = position, confidence
-        expected_positions = [best_position]
-        fallback_anchor = anchor_by_position.get(best_position)
-        if fallback_count != 1 or threshold_count != 0 or fallback_anchor is None or not bool(fallback_anchor.get("is_highest_confidence")):
-            return None, "actual_batch_disagrees_with_original_fallback_action"
-    if sorted(positions) != expected_positions:
-        return None, "actual_batch_positions_do_not_match_original_threshold_plus_fallback_action"
-    for position, token_id, _confidence in natural_values:
-        if position in anchor_by_position and int(anchor_by_position[position]["token_id"]) != token_id:
-            return None, "actual_batch_tokens_do_not_match_original_threshold_plus_fallback_action"
-
-    summaries = record.get("position_summaries")
-    if not isinstance(summaries, Mapping):
-        return None, "missing_stored_position_summaries"
-    for position in positions:
-        summary = summaries.get(str(position))
-        if not isinstance(summary, Mapping):
-            return None, "missing_stored_base_token_summary"
-        try:
-            stored_token = int(summary["top1_token_id"])
-        except (KeyError, TypeError, ValueError):
-            return None, "invalid_stored_base_token_summary"
-        if stored_token != int(fresh_assignments[position]["token_id"]):
-            return None, "stored_base_token_differs_from_fresh_exact_top1"
-    return sorted(positions), None
-
-
-def _base_assignments(logits: Any, positions: Iterable[int], *, tie_tolerance: float) -> dict[int, dict[str, Any]]:
-    """Extract only the fixed current exact top-1 assignment/scalars per mask."""
+    tie_tolerance: float,
+) -> dict[int, dict[str, Any]]:
+    """Full-vocabulary current top-1 values and p1-p2 margins for a state."""
 
     import torch
 
-    assignments: dict[int, dict[str, Any]] = {}
+    result: dict[int, dict[str, Any]] = {}
     for position in sorted(int(value) for value in positions):
         token_id = int(torch.argmax(logits[0, position].float()).item())
         summary = margin_summary(logits[0], position, token_id, tie_tolerance=tie_tolerance)
-        assignments[position] = {
+        top1_probability = float(summary["assigned_probability"])
+        top2_probability = float(summary["competitor_probability"])
+        result[position] = {
             "token_id": token_id,
-            "top1_probability": float(summary["assigned_probability"]),
-            "logit_margin": float(summary["logit_margin"]),
+            "top1_probability": top1_probability,
             "top2_token_id": int(summary["competitor_token_id"]),
-            "top2_probability": float(summary["competitor_probability"]),
+            "top2_probability": top2_probability,
+            "probability_margin": top1_probability - top2_probability,
+            "logit_margin": float(summary["logit_margin"]),
             "top1_matches_assignment": bool(summary["top1_matches_assignment"]),
             "is_logit_tie": bool(summary["is_logit_tie"]),
         }
-    return assignments
-
-
-def _pool_for_stratum(
-    state: SelectedState,
-    *,
-    actual_batch_positions: Sequence[int],
-    assignments: Mapping[int, Mapping[str, Any]],
-    requested_size: int,
-) -> tuple[dict[str, Any], str | None]:
-    """Construct P=B plus confidence-ranked extras without truncating B."""
-
-    base = list(sorted(int(value) for value in actual_batch_positions))
-    common = _source_common(state)
-    row: dict[str, Any] = {
-        **common,
-        "requested_pool_size": int(requested_size),
-        "actual_fast_dllm_positions": base,
-        "actual_fast_dllm_token_ids": [int(assignments[position]["token_id"]) for position in base],
-        "actual_fast_dllm_size": len(base),
-        "pool_positions": [],
-        "pool_token_ids": [],
-        "pool_top1_probabilities": [],
-        "pool_extra_positions_ranked_by_fresh_confidence": [],
-    }
-    if len(base) > int(requested_size):
-        row.update({
-            "pool_status": "ineligible_base_batch_exceeds_pool_size",
-            "effective_pool_size": None,
-            "pool_size_shortfall": None,
-        })
-        return row, "ineligible_base_batch_exceeds_pool_size"
-    extras = [position for position in assignments if position not in set(base)]
-    extras.sort(key=lambda position: (-float(assignments[position]["top1_probability"]), int(position)))
-    chosen = base + extras[: max(0, int(requested_size) - len(base))]
-    summaries = state.record.get("position_summaries")
-    if not isinstance(summaries, Mapping):
-        row.update({"pool_status": "ineligible_missing_stored_position_summaries", "effective_pool_size": None})
-        return row, "ineligible_missing_stored_position_summaries"
-    for position in chosen:
-        summary = summaries.get(str(position))
-        try:
-            stored_token = int(summary["top1_token_id"]) if isinstance(summary, Mapping) else None
-        except (KeyError, TypeError, ValueError):
-            stored_token = None
-        if stored_token != int(assignments[position]["token_id"]):
-            row.update({
-                "pool_status": "ineligible_stored_pool_token_differs_from_fresh_exact_top1",
-                "stored_mismatch_position": position,
-                "stored_mismatch_token_id": stored_token,
-                "fresh_top1_token_id": int(assignments[position]["token_id"]),
-                "effective_pool_size": None,
-            })
-            return row, "ineligible_stored_pool_token_differs_from_fresh_exact_top1"
-    row.update({
-        "pool_status": "eligible",
-        "effective_pool_size": len(chosen),
-        "pool_size_shortfall": max(0, int(requested_size) - len(chosen)),
-        "pool_positions": chosen,
-        "pool_token_ids": [int(assignments[position]["token_id"]) for position in chosen],
-        "pool_top1_probabilities": [float(assignments[position]["top1_probability"]) for position in chosen],
-        "pool_extra_positions_ranked_by_fresh_confidence": extras,
-    })
-    return row, None
-
-
-def _actual_batch_fresh_token_mismatches(
-    record: Mapping[str, Any], assignments: Mapping[int, Mapping[str, Any]]
-) -> list[dict[str, Any]]:
-    """Make fresh-vs-stored B token exclusions directly inspectable."""
-
-    result: list[dict[str, Any]] = []
-    anchors = record.get("actual_committed_anchors")
-    if not isinstance(anchors, list):
-        return result
-    for anchor in anchors:
-        if not isinstance(anchor, Mapping):
-            continue
-        try:
-            position = int(anchor["position"])
-            stored_token = int(anchor["token_id"])
-        except (KeyError, TypeError, ValueError):
-            continue
-        fresh = assignments.get(position)
-        if fresh is not None and int(fresh["token_id"]) != stored_token:
-            result.append({
-                "position": position,
-                "stored_actual_batch_token_id": stored_token,
-                "fresh_exact_top1_token_id": int(fresh["token_id"]),
-            })
     return result
 
 
-def _context_position_list(mask: int, positions: Sequence[int]) -> list[int]:
-    return [int(positions[index]) for index in mask_indices(int(mask), len(positions))]
+def _native_fast_logits(model: Any, input_ids: Any) -> Any:
+    """Match the historical collector's direct native Fast-dLLM invocation."""
+
+    import torch
+
+    with torch.inference_mode():
+        output = model(input_ids, use_cache=True)
+    logits = getattr(output, "logits", None)
+    if logits is None:
+        raise RuntimeError("Native Fast-dLLM model call did not return logits.")
+    return logits
 
 
-def _evaluate_max_pool_contexts(
-    model: Any,
-    state: SelectedState,
+def _validate_source_t0_replay(seed: PromptSeed, assignments: Mapping[int, Mapping[str, Any]]) -> None:
+    """Fail closed if a fresh exact replay differs from archived t=0 top-1s."""
+
+    expected = dict(seed.source_t0_top1_token_ids)
+    missing = sorted(set(expected) - set(assignments))
+    mismatches = [
+        {
+            "position": position,
+            "source_top1_token_id": expected[position],
+            "fresh_top1_token_id": int(assignments[position]["token_id"]),
+        }
+        for position in sorted(expected)
+        if position in assignments and int(assignments[position]["token_id"]) != int(expected[position])
+    ]
+    if missing or mismatches:
+        raise RuntimeError(
+            f"{seed.prompt_id}: archived exact t=0 replay mismatch; "
+            f"missing_positions={missing}, mismatches={mismatches[:8]}"
+        )
+
+
+def _candidate_margin_payloads(
+    logits: Any,
+    candidate_positions: Sequence[int],
+    candidate_token_ids: Sequence[int],
     *,
-    base_input_ids: Any,
-    base_logits: Any,
-    pool_positions: Sequence[int],
-    pool_token_ids: Sequence[int],
-    batch_size: int,
     tie_tolerance: float,
-    accounting: ForwardAccounting,
-) -> tuple[dict[tuple[int, int], dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Run every subset context once for the maximal nested pool.
+) -> list[list[dict[str, Any]]]:
+    """Reduce all subset/target scalar margins on GPU, then transfer once.
 
-    The base context has already been freshly replayed to establish `y`; it is
-    inserted into the cache rather than repeated.  The full-reveal subset is
-    nevertheless forwarded and logged, despite having zero still-masked pool
-    targets, so every A subset P has a concrete exact evaluation record.
+    The competing token is computed after setting the assigned frozen token to
+    ``-inf``, exactly as the scalar helper does.  It keeps the scalar helper's
+    FP32 ``torch.softmax`` convention, then forms margins and the tie test on
+    the host from the transferred FP32 values, matching its Python-float
+    arithmetic without one CUDA synchronization per scalar query.
     """
 
     import torch
 
-    pool_positions = tuple(int(value) for value in pool_positions)
-    pool_token_ids = tuple(int(value) for value in pool_token_ids)
-    size = len(pool_positions)
-    if size < 1:
-        raise ValueError("An exact headroom pool must contain the nonempty Fast-dLLM batch")
-    if len(pool_token_ids) != size:
-        raise ValueError("pool position/token lengths differ")
-    common = _source_common(state)
-    margins: dict[tuple[int, int], dict[str, Any]] = {}
-    context_rows: list[dict[str, Any]] = []
-    query_rows: list[dict[str, Any]] = []
+    positions = tuple(int(value) for value in candidate_positions)
+    token_ids = tuple(int(value) for value in candidate_token_ids)
+    if not positions or len(positions) != len(token_ids):
+        raise ValueError("Candidate positions and token IDs must be equal-length and nonempty.")
+    if logits.ndim != 3:
+        raise ValueError(f"Expected [batch, sequence, vocab] logits, received shape={tuple(logits.shape)}")
+    position_index = torch.tensor(positions, device=logits.device, dtype=torch.long)
+    assigned_tokens = torch.tensor(token_ids, device=logits.device, dtype=torch.long)
+    rows = logits[:, position_index, :].float()
+    batch_size, candidate_count, vocabulary_size = rows.shape
+    if vocabulary_size < 2:
+        raise ValueError("Full-vocabulary VCCC margins require at least two tokens.")
+    gather_index = assigned_tokens.view(1, candidate_count, 1).expand(batch_size, -1, -1)
+    assigned_logits = rows.gather(dim=-1, index=gather_index).squeeze(-1)
+    competitor_rows = rows.clone()
+    competitor_rows.scatter_(dim=-1, index=gather_index, value=float("-inf"))
+    competitor_logits, competitor_tokens = torch.max(competitor_rows, dim=-1)
+    top1_tokens = torch.argmax(rows, dim=-1)
+    # Reshape is a view for the contiguous advanced-indexed tensor.  Calling
+    # the same FP32 softmax operator as margin_summary avoids substituting a
+    # logsumexp/exp identity with slightly different roundoff behavior.
+    probabilities = torch.softmax(rows.reshape(-1, vocabulary_size), dim=-1).reshape_as(rows)
+    assigned_probabilities = probabilities.gather(dim=-1, index=gather_index).squeeze(-1)
+    competitor_probabilities = probabilities.gather(
+        dim=-1, index=competitor_tokens.unsqueeze(-1)
+    ).squeeze(-1)
+    packed = torch.stack(
+        (
+            assigned_logits,
+            competitor_logits,
+            assigned_probabilities,
+            competitor_probabilities,
+            competitor_tokens.to(dtype=rows.dtype),
+            top1_tokens.to(dtype=rows.dtype),
+        ),
+        dim=-1,
+    )
+    # One device-to-host transfer per model batch replaces K scalar transfers
+    # per subset context. Token IDs are safely exact in fp32 at this vocabulary
+    # size; convert them back to ints in the portable record below.
+    values = packed.detach().cpu().tolist()
+    return [
+        [
+            {
+                "logit_margin": float(cell[0]) - float(cell[1]),
+                "probability_margin": float(cell[2]) - float(cell[3]),
+                "assigned_probability": float(cell[2]),
+                "competitor_probability": float(cell[3]),
+                "competitor_token_id": int(cell[4]),
+                "top1_token_id": int(cell[5]),
+                "top1_matches_assignment": int(cell[5]) == int(token_ids[target_index]),
+                "is_logit_tie": abs(float(cell[0]) - float(cell[1])) <= float(tie_tolerance),
+            }
+            for target_index, cell in enumerate(batch)
+        ]
+        for batch in values
+    ]
 
-    def consume(mask: int, logits: Any, row_index: int, *, forward_source: str) -> None:
-        revealed_positions = _context_position_list(mask, pool_positions)
-        revealed_token_ids = [pool_token_ids[index] for index in mask_indices(mask, size)]
-        context_rows.append({
+
+def validate_vectorized_margin_reducer(
+    logits: Any,
+    candidate_positions: Sequence[int],
+    candidate_token_ids: Sequence[int],
+    *,
+    tie_tolerance: float,
+) -> dict[str, Any]:
+    """One small runtime equivalence check against the scalar certificate path."""
+
+    reduced = _candidate_margin_payloads(
+        logits, candidate_positions, candidate_token_ids, tie_tolerance=tie_tolerance
+    )
+    mismatches: list[dict[str, Any]] = []
+    for row_index in range(int(logits.shape[0])):
+        for target_index, (position, token_id) in enumerate(
+            zip(candidate_positions, candidate_token_ids, strict=True)
+        ):
+            expected = margin_summary(
+                logits[row_index], int(position), int(token_id), tie_tolerance=tie_tolerance
+            )
+            actual = reduced[row_index][target_index]
+            exact_fields = (
+                "logit_margin",
+                "competitor_token_id",
+                "top1_token_id",
+                "top1_matches_assignment",
+                "is_logit_tie",
+            )
+            if any(actual[field] != expected[field] for field in exact_fields) or any(
+                not math.isclose(
+                    float(actual[field]), float(expected[field]), rel_tol=1.0e-6, abs_tol=1.0e-7
+                )
+                for field in ("probability_margin", "assigned_probability", "competitor_probability")
+            ):
+                mismatches.append({
+                    "row_index": row_index,
+                    "target_position": int(position),
+                    "target_token_id": int(token_id),
+                    "expected": expected,
+                    "actual": actual,
+                })
+    if mismatches:
+        raise RuntimeError(
+            "Vectorized margin reducer diverged from scalar certificate semantics: "
+            + json.dumps(_json_safe(mismatches[:3]), ensure_ascii=False, sort_keys=True)
+        )
+    return {
+        "status": "passed",
+        "validated_batch_count": int(logits.shape[0]),
+        "validated_candidate_count": len(candidate_positions),
+        "additional_model_forwards": 0,
+    }
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    return "out of memory" in str(error).lower()
+
+
+def select_fast_dllm_action(probabilities: Sequence[float], threshold: float) -> tuple[int, ...]:
+    """Normal threshold action with the collector's first-argmax fallback."""
+
+    if not probabilities:
+        raise ValueError("Fast-dLLM action requires at least one masked generation position")
+    selected = [index for index, probability in enumerate(probabilities) if float(probability) >= float(threshold)]
+    best = max(range(len(probabilities)), key=lambda index: (float(probabilities[index]), -index))
+    if best not in selected:
+        selected.append(best)
+    return tuple(sorted(selected))
+
+
+def final_token_agreement(
+    baseline_tokens: Sequence[int], oracle_tokens: Sequence[int]
+) -> dict[str, Any]:
+    """Compare terminal generated positions, not divergent intermediate states."""
+
+    common_length = min(len(baseline_tokens), len(oracle_tokens))
+    matching = sum(
+        int(baseline_tokens[index]) == int(oracle_tokens[index]) for index in range(common_length)
+    )
+    same_length = len(baseline_tokens) == len(oracle_tokens)
+    return {
+        "baseline_generation_length": len(baseline_tokens),
+        "oracle_generation_length": len(oracle_tokens),
+        "same_generation_length": same_length,
+        "compared_token_count": common_length,
+        "matching_token_count": matching,
+        "token_position_agreement": matching / common_length if common_length else None,
+        "final_sequence_exact_match": bool(
+            same_length
+            and all(int(left) == int(right) for left, right in zip(baseline_tokens, oracle_tokens, strict=True))
+        ),
+    }
+
+
+def _context_positions(mask: int, positions: Sequence[int]) -> list[int]:
+    return [int(positions[index]) for index in mask_indices(int(mask), len(positions))]
+
+
+def _evaluate_candidate_contexts(
+    model: Any,
+    input_ids: Any,
+    base_logits: Any,
+    *,
+    common: Mapping[str, Any],
+    candidate_positions: Sequence[int],
+    candidate_token_ids: Sequence[int],
+    subset_batch_size: int,
+    tie_tolerance: float,
+    accounting: ForwardAccounting,
+) -> tuple[dict[tuple[int, int], dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Evaluate every subset of one current top-K pool with no-cache forwards."""
+
+    import torch
+
+    positions = tuple(int(value) for value in candidate_positions)
+    token_ids = tuple(int(value) for value in candidate_token_ids)
+    if not positions or len(positions) != len(token_ids):
+        raise ValueError("Candidate positions and tokens must be equal-length and nonempty.")
+    size = len(positions)
+    margins: dict[tuple[int, int], dict[str, Any]] = {}
+    contexts: list[dict[str, Any]] = []
+    queries: list[dict[str, Any]] = []
+
+    def consume(
+        mask: int,
+        payloads: Sequence[Sequence[Mapping[str, Any]]],
+        row_index: int,
+        source: str,
+        successful_batch_size: int,
+    ) -> None:
+        revealed = _context_positions(mask, positions)
+        contexts.append({
             **common,
-            "max_pool_size": size,
+            "effective_candidate_k": size,
             "revealed_mask": int(mask),
-            "revealed_positions": revealed_positions,
-            "revealed_token_ids": revealed_token_ids,
-            "still_masked_pool_count": size - int(mask).bit_count(),
-            "forward_source": forward_source,
-            "full_reveal_has_no_pool_target_query": int(mask).bit_count() == size,
+            "revealed_positions": revealed,
+            "revealed_count": len(revealed),
+            "still_masked_candidate_count": size - int(mask).bit_count(),
+            "forward_source": source,
+            "successful_subset_batch_size": int(successful_batch_size),
+            "full_reveal_has_no_candidate_target_query": int(mask).bit_count() == size,
         })
-        for target_index, (position, token_id) in enumerate(zip(pool_positions, pool_token_ids, strict=True)):
-            if mask & (1 << target_index):
+        for target_index, (position, token_id) in enumerate(zip(positions, token_ids, strict=True)):
+            if int(mask) & (1 << target_index):
                 continue
-            payload = margin_summary(logits[row_index], position, token_id, tie_tolerance=tie_tolerance)
+            payload = dict(payloads[row_index][target_index])
             payload.update({"target_index": target_index, "revealed_mask": int(mask)})
             margins[(target_index, int(mask))] = payload
-            query_rows.append({
+            queries.append({
                 **common,
-                "max_pool_size": size,
-                "target_pool_index": target_index,
+                "effective_candidate_k": size,
+                "target_candidate_index": target_index,
                 "target_position": position,
                 "target_token_id": token_id,
                 "revealed_mask": int(mask),
-                "revealed_positions": revealed_positions,
                 "logit_margin": payload["logit_margin"],
+                "probability_margin": payload["probability_margin"],
                 "assigned_probability": payload["assigned_probability"],
                 "competitor_token_id": payload["competitor_token_id"],
                 "competitor_probability": payload["competitor_probability"],
                 "top1_token_id": payload["top1_token_id"],
                 "top1_matches_assignment": payload["top1_matches_assignment"],
                 "is_logit_tie": payload["is_logit_tie"],
-                "forward_source": forward_source,
+                "forward_source": source,
             })
 
-    consume(0, base_logits, 0, forward_source="fresh_base_exact_no_cache")
+    base_payloads = _candidate_margin_payloads(
+        base_logits, positions, token_ids, tie_tolerance=tie_tolerance
+    )
+    consume(0, base_payloads, 0, "fresh_base_exact_no_cache", 1)
     branch_masks = list(range(1, 1 << size))
-    for start in range(0, len(branch_masks), int(batch_size)):
-        masks = branch_masks[start : start + int(batch_size)]
-        branches = base_input_ids.expand(len(masks), -1).clone()
-        for row_index, mask in enumerate(masks):
-            for pool_index, position in enumerate(pool_positions):
-                if mask & (1 << pool_index):
-                    branches[row_index, position] = pool_token_ids[pool_index]
-        logits = exact_logits_batched(model, branches)
+    current_batch_size = max(1, int(subset_batch_size))
+    start = 0
+    while start < len(branch_masks):
+        masks = branch_masks[start : start + current_batch_size]
+        branches = None
+        logits = None
+        payloads = None
+        try:
+            branches = input_ids.expand(len(masks), -1).clone()
+            for row_index, mask in enumerate(masks):
+                for candidate_index, position in enumerate(positions):
+                    if int(mask) & (1 << candidate_index):
+                        branches[row_index, position] = token_ids[candidate_index]
+            logits = exact_logits_batched(model, branches)
+            # The reducer itself materializes [batch, K, vocab] FP32 views;
+            # include it in the same adaptive OOM boundary as the forward.
+            payloads = _candidate_margin_payloads(
+                logits, positions, token_ids, tie_tolerance=tie_tolerance
+            )
+        except RuntimeError as error:
+            accounting.failed_model_batch_calls += 1
+            if not _is_cuda_oom(error) or current_batch_size == 1:
+                raise
+            accounting.subset_oom_retries += 1
+            del logits, payloads, branches
+            if bool(torch.cuda.is_available()):
+                torch.cuda.empty_cache()
+            current_batch_size = max(1, current_batch_size // 2)
+            continue
         accounting.model_batch_calls += 1
         accounting.subset_context_forwards += len(masks)
-        for row_index, mask in enumerate(masks):
-            consume(mask, logits, row_index, forward_source="subset_exact_no_cache")
-        del logits, branches
-    del base_input_ids
-    return margins, context_rows, query_rows
-
-
-def _selected_payload(mask: int, positions: Sequence[int], token_ids: Sequence[int], probabilities: Sequence[float]) -> dict[str, Any]:
-    indices = mask_indices(int(mask), len(positions))
-    return {
-        "selected_mask": int(mask),
-        "selected_pool_indices": list(indices),
-        "selected_positions": [int(positions[index]) for index in indices],
-        "selected_top1_token_ids": [int(token_ids[index]) for index in indices],
-        "selected_top1_probabilities": [float(probabilities[index]) for index in indices],
-        "selected_size": len(indices),
-    }
-
-
-def _witness_payload(
-    certificate: SetCertificate,
-    *,
-    positions: Sequence[int],
-    token_ids: Sequence[int],
-) -> dict[str, Any]:
-    """Turn a subset query witness into positions without trajectory claims."""
-
-    if certificate.first_failure_target_index is None:
-        return {
-            "first_failure_target_position": None,
-            "first_failure_target_token_id": None,
-            "first_failure_revealed_subset_positions": [],
-            "first_failure_revealed_subset_token_ids": [],
-            "first_failure_canonical_completion_order_positions": [],
-            "first_failure_is_all_order_query_witness": False,
-        }
-    target = int(certificate.first_failure_target_index)
-    revealed = certificate.first_failure_revealed_mask or 0
-    revealed_indices = mask_indices(revealed, len(positions))
-    selected_indices = mask_indices(certificate.selected_mask, len(positions))
-    remaining = [index for index in selected_indices if index != target and index not in revealed_indices]
-    canonical = sorted(int(positions[index]) for index in revealed_indices) + [int(positions[target])] + sorted(
-        int(positions[index]) for index in remaining
-    )
-    return {
-        "first_failure_target_position": int(positions[target]),
-        "first_failure_target_token_id": int(token_ids[target]),
-        "first_failure_revealed_subset_positions": [int(positions[index]) for index in revealed_indices],
-        "first_failure_revealed_subset_token_ids": [int(token_ids[index]) for index in revealed_indices],
-        "first_failure_canonical_completion_order_positions": canonical,
-        "first_failure_is_all_order_query_witness": True,
-    }
-
-
-def _certificate_payload(certificate: SetCertificate, *, positions: Sequence[int], token_ids: Sequence[int]) -> dict[str, Any]:
-    return {
-        "certificate_pass": bool(certificate.passes),
-        "batch_failure": not bool(certificate.passes),
-        "certificate_margin": certificate.certificate_margin,
-        "certificate_query_count": certificate.query_count,
-        "certificate_missing_query_count": certificate.missing_query_count,
-        "certificate_vacuous_empty_set": certificate.vacuous,
-        "token_violation_count": len(certificate.violating_indices),
-        "token_violating_positions": [int(positions[index]) for index in certificate.violating_indices],
-        "token_violating_token_ids": [int(token_ids[index]) for index in certificate.violating_indices],
-        "minimum_margin_target_position": (
-            None if certificate.minimum_margin_target_index is None else int(positions[certificate.minimum_margin_target_index])
-        ),
-        "minimum_margin_revealed_subset_positions": (
-            []
-            if certificate.minimum_margin_revealed_mask is None
-            else _context_position_list(certificate.minimum_margin_revealed_mask, positions)
-        ),
-        "first_failure_margin": certificate.first_failure_margin,
-        "first_failure_top1_matches_assignment": certificate.first_failure_top1_matches,
-        "first_failure_is_logit_tie": certificate.first_failure_is_tie,
-        **_witness_payload(certificate, positions=positions, token_ids=token_ids),
-    }
-
-
-def _policy_row(
-    state: SelectedState,
-    *,
-    requested_pool_size: int,
-    effective_pool_size: int,
-    gamma: float,
-    policy: str,
-    policy_variant: str | None,
-    selected_mask: int | None,
-    certificate: SetCertificate | None,
-    positions: Sequence[int],
-    token_ids: Sequence[int],
-    probabilities: Sequence[float],
-    base_mask: int,
-    extension_status: str | None = None,
-) -> dict[str, Any]:
-    """One complete state-policy result row, including explicit base failure."""
-
-    base = {
-        **_source_common(state),
-        "requested_pool_size": int(requested_pool_size),
-        "effective_pool_size": int(effective_pool_size),
-        "gamma": float(gamma),
-        "policy": policy,
-        "policy_variant": policy_variant,
-        "actual_fast_dllm_size": int(base_mask).bit_count(),
-        "actual_fast_dllm_positions": _selected_payload(base_mask, positions, token_ids, probabilities)["selected_positions"],
-        "actual_fast_dllm_mask": int(base_mask),
-        "extension_status": extension_status,
-    }
-    if selected_mask is None or certificate is None:
-        return {
-            **base,
-            "selected_mask": None,
-            "selected_pool_indices": [],
-            "selected_positions": [],
-            "selected_top1_token_ids": [],
-            "selected_top1_probabilities": [],
-            "selected_size": None,
-            "certificate_pass": None,
-            "batch_failure": None,
-            "certificate_margin": None,
-            "certificate_query_count": None,
-            "certificate_missing_query_count": None,
-            "certificate_vacuous_empty_set": None,
-            "token_violation_count": None,
-            "token_violating_positions": [],
-            "token_violating_token_ids": [],
-            "mean_extra_vs_actual_fast_dllm": None,
-            "safe_added_capacity": None,
-            "has_at_least_one_safe_extra": False,
-        }
-    selected = _selected_payload(selected_mask, positions, token_ids, probabilities)
-    extra = int(selected["selected_size"]) - int(base_mask).bit_count()
-    return {
-        **base,
-        **selected,
-        **_certificate_payload(certificate, positions=positions, token_ids=token_ids),
-        "mean_extra_vs_actual_fast_dllm": extra,
-        "safe_added_capacity": extra if policy == POLICY_EXTENSION and certificate.passes else None,
-        "has_at_least_one_safe_extra": bool(policy == POLICY_EXTENSION and certificate.passes and extra > 0),
-        "free_oracle_drops_actual_base_token": bool(policy == POLICY_FREE and (int(selected_mask) & int(base_mask)) != int(base_mask)),
-    }
-
-
-def evaluate_policies_for_pool(
-    state: SelectedState,
-    *,
-    requested_pool_size: int,
-    positions: Sequence[int],
-    token_ids: Sequence[int],
-    probabilities: Sequence[float],
-    actual_batch_positions: Sequence[int],
-    margins: Mapping[tuple[int, int], Mapping[str, Any] | float],
-    config: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Use the cached subset grid for B, preserving/free, and confidence policies."""
-
-    position_to_index = {int(position): index for index, position in enumerate(positions)}
-    base_mask = sum(1 << position_to_index[int(position)] for position in actual_batch_positions)
-    if base_mask.bit_count() != len(actual_batch_positions):
-        raise RuntimeError("Fast-dLLM batch is not contained in its eligible pool")
-    policy_rows: list[dict[str, Any]] = []
-    token_rows: list[dict[str, Any]] = []
-    tolerance = float(config["certificate"]["tie_tolerance"])
-    for gamma in (float(value) for value in config["sampling"]["margin_thresholds"]):
-        certificates = certificate_cache_for_gamma(margins, len(positions), gamma, tolerance=tolerance)
-        base_certificate = certificates[base_mask]
-        row_specs: list[tuple[str, str | None, int | None, SetCertificate | None, str | None]] = [
-            (POLICY_FAST, None, base_mask, base_certificate, None),
-        ]
-        if base_certificate.passes:
-            extended_mask = choose_largest_safe_mask(certificates, probabilities, positions, required_mask=base_mask)
-            if extended_mask is None:  # Impossible if B itself passes, but never silently coerce it.
-                row_specs.append((POLICY_EXTENSION, None, None, None, "internal_no_preserving_safe_superset"))
-            else:
-                row_specs.append((POLICY_EXTENSION, None, extended_mask, certificates[extended_mask], "base_batch_exact_certificate_passed"))
+        if accounting.smallest_successful_subset_batch_size is None:
+            accounting.smallest_successful_subset_batch_size = len(masks)
         else:
-            row_specs.append((POLICY_EXTENSION, None, None, None, "base_batch_exact_certificate_failed"))
-        free_mask = choose_largest_safe_mask(certificates, probabilities, positions)
-        if free_mask is None:
-            raise RuntimeError("The empty set must be a vacuously safe free-oracle solution")
-        row_specs.append((POLICY_FREE, "upper_bound_only", free_mask, certificates[free_mask], None))
-        for tau in (float(value) for value in config["sampling"]["confidence_thresholds"]):
-            selected_mask = confidence_selected_mask(probabilities, tau)
-            row_specs.append((POLICY_CONFIDENCE, f"tau={tau:g}", selected_mask, certificates[selected_mask], None))
-
-        for policy, variant, selected_mask, certificate, extension_status in row_specs:
-            row = _policy_row(
-                state,
-                requested_pool_size=requested_pool_size,
-                effective_pool_size=len(positions),
-                gamma=gamma,
-                policy=policy,
-                policy_variant=variant,
-                selected_mask=selected_mask,
-                certificate=certificate,
-                positions=positions,
-                token_ids=token_ids,
-                probabilities=probabilities,
-                base_mask=base_mask,
-                extension_status=extension_status,
+            accounting.smallest_successful_subset_batch_size = min(
+                accounting.smallest_successful_subset_batch_size, len(masks)
             )
-            policy_rows.append(row)
-            if selected_mask is None or certificate is None:
-                continue
-            for index in mask_indices(selected_mask, len(positions)):
-                target_failure = first_target_failure(
-                    margins,
-                    selected_mask,
-                    index,
-                    gamma,
-                    tolerance=tolerance,
-                )
-                revealed_mask = None if target_failure is None else int(target_failure["revealed_mask"])
-                revealed_indices = () if revealed_mask is None else mask_indices(revealed_mask, len(positions))
-                remaining = [
-                    candidate
-                    for candidate in mask_indices(selected_mask, len(positions))
-                    if candidate != index and candidate not in revealed_indices
-                ]
-                token_rows.append({
-                    **_source_common(state),
-                    "requested_pool_size": int(requested_pool_size),
-                    "effective_pool_size": len(positions),
-                    "gamma": gamma,
-                    "policy": policy,
-                    "policy_variant": variant,
-                    "selected_position": int(positions[index]),
-                    "selected_token_id": int(token_ids[index]),
-                    "selected_top1_probability": float(probabilities[index]),
-                    "token_violated": target_failure is not None,
-                    "witness_revealed_subset_positions": [int(positions[value]) for value in revealed_indices],
-                    "witness_revealed_subset_token_ids": [int(token_ids[value]) for value in revealed_indices],
-                    "witness_target_position": int(positions[index]) if target_failure is not None else None,
-                    "witness_target_token_id": int(token_ids[index]) if target_failure is not None else None,
-                    "witness_logit_margin": None if target_failure is None else target_failure["logit_margin"],
-                    "witness_top1_matches_assignment": None if target_failure is None else target_failure["top1_matches_assignment"],
-                    "witness_is_logit_tie": None if target_failure is None else target_failure["is_logit_tie"],
-                    "witness_canonical_completion_order_positions": (
-                        []
-                        if target_failure is None
-                        else sorted(int(positions[value]) for value in revealed_indices)
-                        + [int(positions[index])]
-                        + sorted(int(positions[value]) for value in remaining)
-                    ),
-                    "witness_is_all_order_query_witness": target_failure is not None,
-                })
-    return policy_rows, token_rows
+        for row_index, mask in enumerate(masks):
+            consume(mask, payloads, row_index, "subset_exact_no_cache", len(masks))
+        start += len(masks)
+        del logits, branches, payloads
+    return margins, contexts, queries
 
 
-def _row_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
-    """Stable policy-result key used to join state and token evidence."""
+def _common_step_fields(
+    seed: PromptSeed,
+    *,
+    policy: str,
+    candidate_k: int | None,
+    forward_convention: str,
+    step: int,
+) -> dict[str, Any]:
+    return {
+        "prompt_id": seed.prompt_id,
+        "dataset": seed.dataset,
+        "example_id": seed.example_id,
+        "source_representative_state_key": seed.source_representative_state_key,
+        "source_t0_state_key": seed.source_t0_state_key,
+        "policy": policy,
+        "candidate_k": candidate_k,
+        "forward_convention": forward_convention,
+        "step": int(step),
+    }
 
-    return (
-        str(row.get("state_key")),
-        str(row.get("cohort")),
-        int(row.get("requested_pool_size")),
-        float(row.get("gamma")),
-        str(row.get("policy")),
-        str(row.get("policy_variant") or ""),
+
+def _fast_rollout(
+    model: Any,
+    seed: PromptSeed,
+    *,
+    mask_token_id: int,
+    threshold: float,
+    tie_tolerance: float,
+    policy: str,
+    forward_convention: str,
+    native_use_cache: bool,
+    validate_source_t0: bool,
+) -> RolloutResult:
+    """Fresh threshold=.8 rollout from the shared t=0 seed."""
+
+    import torch
+
+    device = next(model.parameters()).device
+    x = torch.tensor([seed.token_sequence], device=device, dtype=torch.long)
+    accounting = ForwardAccounting()
+    rows: list[dict[str, Any]] = []
+    _sync_cuda(torch)
+    started = time.perf_counter()
+    for step in range(int(seed.generation_length)):
+        active = _active_generation_positions(x, seed, mask_token_id=mask_token_id)
+        if not active:
+            break
+        logits = _native_fast_logits(model, x) if native_use_cache else exact_logits_batched(model, x)
+        accounting.action_forwards += 1
+        accounting.model_batch_calls += 1
+        assignments = _base_assignments(logits, active, tie_tolerance=tie_tolerance)
+        if step == 0 and validate_source_t0:
+            _validate_source_t0_replay(seed, assignments)
+        probabilities = [float(assignments[position]["top1_probability"]) for position in active]
+        selected_indices = select_fast_dllm_action(probabilities, threshold)
+        threshold_indices = tuple(
+            index for index, probability in enumerate(probabilities) if probability >= float(threshold)
+        )
+        fallback_used = not threshold_indices
+        selected_positions = [int(active[index]) for index in selected_indices]
+        selected_tokens = [int(assignments[position]["token_id"]) for position in selected_positions]
+        for position, token_id in zip(selected_positions, selected_tokens, strict=True):
+            x[0, position] = token_id
+        common = _common_step_fields(
+            seed,
+            policy=policy,
+            candidate_k=None,
+            forward_convention=forward_convention,
+            step=step,
+        )
+        rows.append({
+            **common,
+            "remaining_generation_masks_before": len(active),
+            "remaining_generation_masks_after": len(active) - len(selected_positions),
+            "baseline_threshold": float(threshold),
+            "candidate_requested_k": None,
+            "effective_candidate_k": None,
+            "candidate_positions": [],
+            "candidate_top1_token_ids": [],
+            "candidate_top1_probabilities": [],
+            "candidate_top2_probabilities": [],
+            "candidate_probability_margins": [],
+            "full_candidate_set_certificate_pass": None,
+            "selected_set_certificate_pass": None,
+            "selected_set_certificate_min_logit_margin": None,
+            "selected_set_certificate_query_count": None,
+            "selected_positions": selected_positions,
+            "selected_top1_token_ids": selected_tokens,
+            "actual_commit_set_size": len(selected_positions),
+            "threshold_eligible_positions": [int(active[index]) for index in threshold_indices],
+            "fallback_used": fallback_used,
+        })
+        accounting.policy_action_steps += 1
+        accounting.committed_tokens += len(selected_positions)
+        del logits
+    _sync_cuda(torch)
+    elapsed = time.perf_counter() - started
+    completed = not _active_generation_positions(x, seed, mask_token_id=mask_token_id)
+    return RolloutResult(
+        prompt_id=seed.prompt_id,
+        dataset=seed.dataset,
+        example_id=seed.example_id,
+        policy=policy,
+        candidate_k=None,
+        forward_convention=forward_convention,
+        completed=completed,
+        terminal_status="completed" if completed else "max_steps_reached_with_generation_masks",
+        final_generation_token_ids=tuple(
+            int(value) for value in x[0, seed.generation_start :].detach().cpu().tolist()
+        ),
+        wall_seconds=elapsed,
+        accounting=accounting,
+        step_rows=rows,
+        context_rows=[],
+        query_rows=[],
+    )
+
+
+def _exact_oracle_rollout(
+    model: Any,
+    seed: PromptSeed,
+    *,
+    mask_token_id: int,
+    candidate_k: int,
+    subset_batch_size: int,
+    gamma: float,
+    tie_tolerance: float,
+) -> RolloutResult:
+    """Fresh exact-VCCC rollout that commits C_K at every action step."""
+
+    import torch
+
+    device = next(model.parameters()).device
+    x = torch.tensor([seed.token_sequence], device=device, dtype=torch.long)
+    accounting = ForwardAccounting()
+    rows: list[dict[str, Any]] = []
+    contexts: list[dict[str, Any]] = []
+    queries: list[dict[str, Any]] = []
+    _sync_cuda(torch)
+    started = time.perf_counter()
+    for step in range(int(seed.generation_length)):
+        active = _active_generation_positions(x, seed, mask_token_id=mask_token_id)
+        if not active:
+            break
+        base_logits = exact_logits_batched(model, x)
+        accounting.action_forwards += 1
+        accounting.model_batch_calls += 1
+        assignments = _base_assignments(base_logits, active, tie_tolerance=tie_tolerance)
+        ranked_active_positions = select_top_probability_margin_positions(assignments, len(assignments))
+        candidate_positions = ranked_active_positions[: int(candidate_k)]
+        candidate_token_ids = tuple(int(assignments[position]["token_id"]) for position in candidate_positions)
+        candidate_probabilities = tuple(
+            float(assignments[position]["top1_probability"]) for position in candidate_positions
+        )
+        candidate_top2_probabilities = tuple(
+            float(assignments[position]["top2_probability"]) for position in candidate_positions
+        )
+        candidate_probability_margins = tuple(
+            float(assignments[position]["probability_margin"]) for position in candidate_positions
+        )
+        common = _common_step_fields(
+            seed,
+            policy=EXACT_POLICY,
+            candidate_k=int(candidate_k),
+            forward_convention=EXACT_FORWARD_CONVENTION,
+            step=step,
+        )
+        margins, state_contexts, state_queries = _evaluate_candidate_contexts(
+            model,
+            x,
+            base_logits,
+            common=common,
+            candidate_positions=candidate_positions,
+            candidate_token_ids=candidate_token_ids,
+            subset_batch_size=int(subset_batch_size),
+            tie_tolerance=float(tie_tolerance),
+            accounting=accounting,
+        )
+        contexts.extend(state_contexts)
+        queries.extend(state_queries)
+        certificates = certificate_cache_for_gamma(
+            margins,
+            len(candidate_positions),
+            float(gamma),
+            tolerance=float(tie_tolerance),
+        )
+        full_mask = (1 << len(candidate_positions)) - 1
+        full_certificate = certificates[full_mask]
+        selected_mask = choose_largest_safe_mask(
+            certificates,
+            candidate_probabilities,
+            candidate_positions,
+            tie_scores=candidate_probability_margins,
+        )
+        if selected_mask is None or int(selected_mask) == 0:
+            raise RuntimeError(
+                f"{seed.prompt_id}: exact VCCC found no nonempty safe subset at K={candidate_k}, step={step}"
+            )
+        selected_certificate = certificates[int(selected_mask)]
+        if not selected_certificate.passes:
+            raise RuntimeError("Selected exact VCCC set does not pass its cached all-order certificate.")
+        selected_indices = mask_indices(int(selected_mask), len(candidate_positions))
+        selected_positions = [int(candidate_positions[index]) for index in selected_indices]
+        selected_tokens = [int(candidate_token_ids[index]) for index in selected_indices]
+        for position, token_id in zip(selected_positions, selected_tokens, strict=True):
+            x[0, position] = token_id
+        rows.append({
+            **common,
+            "remaining_generation_masks_before": len(active),
+            "remaining_generation_masks_after": len(active) - len(selected_positions),
+            "baseline_threshold": None,
+            "candidate_requested_k": int(candidate_k),
+            "effective_candidate_k": len(candidate_positions),
+            "candidate_positions": list(candidate_positions),
+            "candidate_top1_token_ids": list(candidate_token_ids),
+            "candidate_top1_probabilities": list(candidate_probabilities),
+            "candidate_top2_probabilities": list(candidate_top2_probabilities),
+            "candidate_probability_margins": list(candidate_probability_margins),
+            # Keep the entire <=16-position current ranking and cut-off so
+            # P_K can be independently reconstructed from raw action rows.
+            "ranked_active_positions": list(ranked_active_positions),
+            "ranked_active_top1_probabilities": [
+                float(assignments[position]["top1_probability"]) for position in ranked_active_positions
+            ],
+            "ranked_active_top2_probabilities": [
+                float(assignments[position]["top2_probability"]) for position in ranked_active_positions
+            ],
+            "ranked_active_probability_margins": [
+                float(assignments[position]["probability_margin"]) for position in ranked_active_positions
+            ],
+            "candidate_cutoff_probability_margin": (
+                float(assignments[candidate_positions[-1]]["probability_margin"])
+                if candidate_positions
+                else None
+            ),
+            "next_excluded_probability_margin": (
+                float(assignments[ranked_active_positions[len(candidate_positions)]]["probability_margin"])
+                if len(ranked_active_positions) > len(candidate_positions)
+                else None
+            ),
+            "full_candidate_set_certificate_pass": bool(full_certificate.passes),
+            "full_candidate_set_certificate_min_logit_margin": full_certificate.certificate_margin,
+            "full_candidate_set_certificate_query_count": full_certificate.query_count,
+            "selected_set_certificate_pass": bool(selected_certificate.passes),
+            "selected_set_certificate_min_logit_margin": selected_certificate.certificate_margin,
+            "selected_set_certificate_query_count": selected_certificate.query_count,
+            "selected_set_certificate_missing_query_count": selected_certificate.missing_query_count,
+            "selected_positions": selected_positions,
+            "selected_top1_token_ids": selected_tokens,
+            "actual_commit_set_size": len(selected_positions),
+            "threshold_eligible_positions": [],
+            "fallback_used": False,
+        })
+        accounting.policy_action_steps += 1
+        accounting.committed_tokens += len(selected_positions)
+        del base_logits
+    _sync_cuda(torch)
+    elapsed = time.perf_counter() - started
+    completed = not _active_generation_positions(x, seed, mask_token_id=mask_token_id)
+    return RolloutResult(
+        prompt_id=seed.prompt_id,
+        dataset=seed.dataset,
+        example_id=seed.example_id,
+        policy=EXACT_POLICY,
+        candidate_k=int(candidate_k),
+        forward_convention=EXACT_FORWARD_CONVENTION,
+        completed=completed,
+        terminal_status="completed" if completed else "max_steps_reached_with_generation_masks",
+        final_generation_token_ids=tuple(
+            int(value) for value in x[0, seed.generation_start :].detach().cpu().tolist()
+        ),
+        wall_seconds=elapsed,
+        accounting=accounting,
+        step_rows=rows,
+        context_rows=contexts,
+        query_rows=queries,
     )
 
 
@@ -874,8 +1127,6 @@ def _descriptive_quantile(values: Sequence[float], fraction: float) -> float | N
     if not values:
         return None
     ordered = sorted(float(value) for value in values)
-    if len(ordered) == 1:
-        return ordered[0]
     location = (len(ordered) - 1) * float(fraction)
     low = int(math.floor(location))
     high = int(math.ceil(location))
@@ -889,28 +1140,23 @@ def _metric_stats(
     iterations: int,
     seed: int,
 ) -> dict[str, Any]:
-    """Prompt-macro CIs with the raw micro statistic retained alongside."""
-
-    valid: list[dict[str, Any]] = []
-    for row in rows:
-        value = _finite_float(row.get(field))
-        prompt = row.get("prompt_id")
-        if value is None or prompt is None:
-            continue
-        valid.append({"prompt_id": str(prompt), field: value})
-    if not valid:
+    values = [
+        {"prompt_id": str(row["prompt_id"]), field: value}
+        for row in rows
+        if row.get("prompt_id") is not None and (value := _finite_float(row.get(field))) is not None
+    ]
+    if not values:
         return {
-            "availability": "zero_count",
+            "availability": "unavailable",
             "observation_count": 0,
             "micro_estimate": None,
             "prompt_macro_estimate": None,
             "prompt_clustered_ci95_low": None,
             "prompt_clustered_ci95_high": None,
             "prompt_cluster_count": 0,
-            "bootstrap_iterations": int(iterations),
         }
-    boot = prompt_clustered_bootstrap(
-        valid,
+    bootstrap = prompt_clustered_bootstrap(
+        values,
         value_field=field,
         prompt_field="prompt_id",
         iterations=int(iterations),
@@ -919,18 +1165,16 @@ def _metric_stats(
     )
     return {
         "availability": "available",
-        "observation_count": len(valid),
-        "micro_estimate": math.fsum(float(row[field]) for row in valid) / len(valid),
-        "prompt_macro_estimate": boot["estimate"],
-        "prompt_clustered_ci95_low": boot["ci95_low"],
-        "prompt_clustered_ci95_high": boot["ci95_high"],
-        "prompt_cluster_count": boot["cluster_count"],
-        "bootstrap_iterations": boot["iterations"],
-        "bootstrap_backend": boot.get("bootstrap_backend"),
+        "observation_count": len(values),
+        "micro_estimate": math.fsum(float(row[field]) for row in values) / len(values),
+        "prompt_macro_estimate": bootstrap["estimate"],
+        "prompt_clustered_ci95_low": bootstrap["ci95_low"],
+        "prompt_clustered_ci95_high": bootstrap["ci95_high"],
+        "prompt_cluster_count": bootstrap["cluster_count"],
     }
 
 
-def _put_metric(
+def _attach_metric(
     destination: dict[str, Any],
     prefix: str,
     rows: Sequence[Mapping[str, Any]],
@@ -943,841 +1187,455 @@ def _put_metric(
         destination[f"{prefix}_{key}"] = value
 
 
-def _summary_scope_rows(rows: Sequence[Mapping[str, Any]], *, scope: str) -> list[Mapping[str, Any]]:
-    if scope == "all_eligible":
-        return list(rows)
-    if scope == "common_eligible_M4_M6_M8":
-        return [row for row in rows if bool(row.get("common_eligible_M4_M6_M8"))]
-    raise ValueError(f"Unknown summary scope {scope!r}")
-
-
-def summarize_policies(
-    policy_rows: Sequence[Mapping[str, Any]],
-    token_rows: Sequence[Mapping[str, Any]],
-    config: Mapping[str, Any],
+def throughput_summary(
+    prompt_rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
-    """Report counts/certificate risk/capacity without pooling cohorts or M."""
+    """Policy/K summaries with full verification cost in measured timing."""
 
-    iterations = int(config["sampling"]["clustered_bootstrap_replicates"])
-    seed = int(config["sampling"]["bootstrap_seed"])
-    output: list[dict[str, Any]] = []
-    # Requested M is the experimental stratum.  Effective pool size can be
-    # smaller when fewer masked positions remain, so keep its distribution in
-    # the row rather than accidentally treating that availability artifact as
-    # a separate experiment.
-    group_fields = ("cohort", "requested_pool_size", "gamma", "policy", "policy_variant")
-    for scope in ("all_eligible", "common_eligible_M4_M6_M8"):
-        scoped_states = _summary_scope_rows(policy_rows, scope=scope)
-        scoped_tokens = _summary_scope_rows(token_rows, scope=scope)
-        groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
-        for row in scoped_states:
-            groups[tuple(row.get(field) for field in group_fields)].append(row)
-        for group_index, (key, rows) in enumerate(sorted(groups.items(), key=lambda item: tuple(str(value) for value in item[0]))):
-            cohort, requested_size, gamma, policy, variant = key
-            selected = [row for row in rows if row.get("selected_size") is not None]
-            state_keys = {_row_key(row) for row in rows}
-            group_tokens = [row for row in scoped_tokens if _row_key(row) in state_keys]
-            counts = [float(row["selected_size"]) for row in selected]
-            extras = [row for row in selected if row.get("mean_extra_vs_actual_fast_dllm") is not None]
-            result: dict[str, Any] = {
-                "scope": scope,
-                "cohort": cohort,
-                "requested_pool_size": requested_size,
-                "effective_pool_size_min": min(int(row["effective_pool_size"]) for row in rows),
-                "effective_pool_size_max": max(int(row["effective_pool_size"]) for row in rows),
-                "effective_pool_size_distribution": dict(Counter(int(row["effective_pool_size"]) for row in rows)),
-                "gamma": gamma,
-                "policy": policy,
-                "policy_variant": variant,
-                "eligible_state_count": len(rows),
-                "selected_set_available_state_count": len(selected),
-                "selected_set_denominator_interpretation": (
-                    "conditional_on_actual_B_exact_certificate_pass"
-                    if policy == POLICY_EXTENSION
-                    else "all_eligible_states_for_this_policy"
-                ),
-                "selected_token_count": len(group_tokens),
-                "median_committed_tokens_per_state": _descriptive_quantile(counts, .5),
-                "q1_committed_tokens_per_state": _descriptive_quantile(counts, .25),
-                "q3_committed_tokens_per_state": _descriptive_quantile(counts, .75),
-                "extension_base_batch_certificate_failed_state_count": sum(
-                    row.get("extension_status") == "base_batch_exact_certificate_failed" for row in rows
-                ),
-                "free_oracle_drops_actual_base_token_state_count": sum(
-                    bool(row.get("free_oracle_drops_actual_base_token")) for row in selected
-                ),
-            }
-            offset = group_index * 17
-            _put_metric(result, "batch_failure", selected, field="batch_failure", iterations=iterations, seed=seed + offset)
-            _put_metric(result, "token_violation", group_tokens, field="token_violated", iterations=iterations, seed=seed + offset + 1)
-            _put_metric(result, "committed_tokens", selected, field="selected_size", iterations=iterations, seed=seed + offset + 2)
-            _put_metric(result, "extra_vs_actual_fast_dllm", extras, field="mean_extra_vs_actual_fast_dllm", iterations=iterations, seed=seed + offset + 3)
-            if policy == POLICY_EXTENSION:
-                base_pass = [row for row in rows if row.get("selected_size") is not None]
-                _put_metric(result, "safe_added_capacity_conditional_on_B_pass", base_pass, field="safe_added_capacity", iterations=iterations, seed=seed + offset + 4)
-                _put_metric(
-                    result,
-                    "actual_fast_dllm_tokens_on_same_B_pass_states",
-                    base_pass,
-                    field="actual_fast_dllm_size",
-                    iterations=iterations,
-                    seed=seed + offset + 14,
-                )
-                _put_metric(result, "state_has_at_least_one_safe_extra", rows, field="has_at_least_one_safe_extra", iterations=iterations, seed=seed + offset + 5)
-                safe_values = [float(row["safe_added_capacity"]) for row in base_pass if row.get("safe_added_capacity") is not None]
-                result["median_safe_added_capacity_conditional_on_B_pass"] = _descriptive_quantile(safe_values, .5)
-            elif policy == POLICY_FREE:
-                _put_metric(
-                    result,
-                    "free_oracle_drops_actual_base_token",
-                    selected,
-                    field="free_oracle_drops_actual_base_token",
-                    iterations=iterations,
-                    seed=seed + offset + 6,
-                )
-                result["median_safe_added_capacity_conditional_on_B_pass"] = None
-            else:
-                result["median_safe_added_capacity_conditional_on_B_pass"] = None
-            mean_count = result.get("committed_tokens_prompt_macro_estimate")
-            result["ideal_commit_tokens_per_decode_step"] = mean_count
-            result["ideal_main_decode_nfe_per_committed_token"] = None if not mean_count else 1.0 / float(mean_count)
-            output.append(result)
-    return output
-
-
-def confidence_sweep_rows(summary_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Keep confidence-only frontiers in a compact, plot-ready table."""
-
+    groups: dict[tuple[str, int | None], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in prompt_rows:
+        groups[(str(row["policy"]), row.get("candidate_k"))].append(row)
+    iterations = int(config["reporting"]["clustered_bootstrap_replicates"])
+    seed = int(config["reporting"]["bootstrap_seed"])
     result: list[dict[str, Any]] = []
-    for row in summary_rows:
-        if row.get("policy") != POLICY_CONFIDENCE:
-            continue
-        variant = str(row.get("policy_variant") or "")
-        try:
-            tau = float(variant.removeprefix("tau="))
-        except ValueError:
-            tau = None
-        result.append({
-            "scope": row.get("scope"),
-            "cohort": row.get("cohort"),
-            "requested_pool_size": row.get("requested_pool_size"),
-            "effective_pool_size_min": row.get("effective_pool_size_min"),
-            "effective_pool_size_max": row.get("effective_pool_size_max"),
-            "gamma": row.get("gamma"),
-            "confidence_threshold": tau,
-            "mean_committed_tokens": row.get("committed_tokens_prompt_macro_estimate"),
-            "mean_committed_tokens_ci95_low": row.get("committed_tokens_prompt_clustered_ci95_low"),
-            "mean_committed_tokens_ci95_high": row.get("committed_tokens_prompt_clustered_ci95_high"),
-            "batch_failure_rate": row.get("batch_failure_prompt_macro_estimate"),
-            "batch_failure_ci95_low": row.get("batch_failure_prompt_clustered_ci95_low"),
-            "batch_failure_ci95_high": row.get("batch_failure_prompt_clustered_ci95_high"),
-            "token_violation_rate": row.get("token_violation_prompt_macro_estimate"),
-            "token_violation_ci95_low": row.get("token_violation_prompt_clustered_ci95_low"),
-            "token_violation_ci95_high": row.get("token_violation_prompt_clustered_ci95_high"),
-            "selected_set_available_state_count": row.get("selected_set_available_state_count"),
-        })
+    for index, ((policy, candidate_k), rows) in enumerate(
+        sorted(groups.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else int(item[0][1])))
+    ):
+        total_seconds = math.fsum(float(row["wall_seconds"]) for row in rows)
+        total_tokens = math.fsum(float(row["committed_tokens"]) for row in rows)
+        summary: dict[str, Any] = {
+            "policy": policy,
+            "candidate_k": candidate_k,
+            "prompt_count": len(rows),
+            "completed_prompt_count": sum(bool(row.get("completed")) for row in rows),
+            "total_committed_generated_positions": total_tokens,
+            "total_wall_seconds": total_seconds,
+            "aggregate_verification_aware_throughput_tokens_per_second": (
+                total_tokens / total_seconds if total_seconds > 0.0 else None
+            ),
+            "total_action_forwards": sum(int(row["action_forwards"]) for row in rows),
+            "total_subset_context_forwards": sum(int(row["subset_context_forwards"]) for row in rows),
+            "total_model_forward_evaluations": sum(int(row["model_forward_evaluations"]) for row in rows),
+            "total_exact_forward_evaluations": sum(
+                int(value)
+                for row in rows
+                if (value := _finite_float(row.get("exact_forward_evaluations"))) is not None
+            ),
+            "total_model_batch_calls": sum(int(row["model_batch_calls"]) for row in rows),
+            "total_failed_model_batch_calls": sum(int(row["failed_model_batch_calls"]) for row in rows),
+            "total_subset_oom_retries": sum(int(row["subset_oom_retries"]) for row in rows),
+        }
+        _attach_metric(
+            summary,
+            "throughput",
+            rows,
+            field="verification_aware_throughput_tokens_per_second",
+            iterations=iterations,
+            seed=seed + index * 17,
+        )
+        _attach_metric(
+            summary,
+            "commits_per_step",
+            rows,
+            field="mean_commits_per_action_step",
+            iterations=iterations,
+            seed=seed + index * 17 + 1,
+        )
+        _attach_metric(
+            summary,
+            "steps",
+            rows,
+            field="policy_action_steps",
+            iterations=iterations,
+            seed=seed + index * 17 + 2,
+        )
+        result.append(summary)
     return result
 
 
-def _rows_for_match(
-    rows: Sequence[Mapping[str, Any]],
-    state_scope: set[tuple[str, str, int, float]],
-    *,
-    policy: str,
-    variant: str | None = None,
-    partition: str | None = None,
-) -> list[Mapping[str, Any]]:
-    result: list[Mapping[str, Any]] = []
-    for row in rows:
-        state_key = (
-            str(row.get("state_key")),
-            str(row.get("cohort")),
-            int(row.get("requested_pool_size")),
-            float(row.get("gamma")),
-        )
-        if state_key not in state_scope or row.get("policy") != policy:
-            continue
-        if variant is not None and str(row.get("policy_variant") or "") != variant:
-            continue
-        if partition is not None and row.get("prompt_partition") != partition:
-            continue
-        result.append(row)
-    return result
+def commit_batch_summary(step_rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Distribution of actual batch sizes, separate from throughput."""
 
-
-def _match_metric_rows(
-    policy_rows: Sequence[Mapping[str, Any]],
-    token_rows: Sequence[Mapping[str, Any]],
-    *,
-    state_scope: set[tuple[str, str, int, float]],
-    policy: str,
-    variant: str | None,
-    partition: str,
-    risk_unit: str,
-) -> tuple[list[Mapping[str, Any]], str]:
-    if risk_unit == "batch_failure":
-        return _rows_for_match(policy_rows, state_scope, policy=policy, variant=variant, partition=partition), "batch_failure"
-    if risk_unit == "token_violation":
-        return _rows_for_match(token_rows, state_scope, policy=policy, variant=variant, partition=partition), "token_violated"
-    raise ValueError(f"Unknown matching risk unit {risk_unit!r}")
-
-
-def _paired_commit_delta_rows(
-    oracle_rows: Sequence[Mapping[str, Any]], confidence_rows: Sequence[Mapping[str, Any]]
-) -> list[dict[str, Any]]:
-    """Pair held-out capacity by identical state before prompt bootstrapping."""
-
-    def key(row: Mapping[str, Any]) -> tuple[str, str, int, float]:
-        return (
-            str(row["state_key"]),
-            str(row["cohort"]),
-            int(row["requested_pool_size"]),
-            float(row["gamma"]),
-        )
-
-    confidence_by_state = {key(row): row for row in confidence_rows if row.get("selected_size") is not None}
-    output: list[dict[str, Any]] = []
-    for oracle in oracle_rows:
-        if oracle.get("selected_size") is None:
-            continue
-        confidence = confidence_by_state.get(key(oracle))
-        if confidence is None:
-            continue
-        delta = int(oracle["selected_size"]) - int(confidence["selected_size"])
-        output.append({
-            "prompt_id": oracle["prompt_id"],
-            "state_key": oracle["state_key"],
-            "oracle_commit_count": int(oracle["selected_size"]),
-            "confidence_commit_count": int(confidence["selected_size"]),
-            "oracle_minus_confidence_commit_count": delta,
-            "oracle_strictly_more_commits_than_confidence": delta > 0,
-        })
-    return output
-
-
-def matched_risk_rows(
-    policy_rows: Sequence[Mapping[str, Any]],
-    token_rows: Sequence[Mapping[str, Any]],
-    config: Mapping[str, Any],
-) -> list[dict[str, Any]]:
-    """Choose tau on calibration prompts only and report held-out exact risk.
-
-    This does not turn the oracle into a predictor.  It merely prevents the
-    confidence threshold frontier from choosing a lucky post-hoc tau on the
-    same prompts it is evaluated on.
-    """
-
-    matching = config["matching"]
-    iterations = int(config["sampling"]["clustered_bootstrap_replicates"])
-    seed = int(config["sampling"]["bootstrap_seed"])
-    output: list[dict[str, Any]] = []
-    dimensions = sorted({
-        (str(row["cohort"]), int(row["requested_pool_size"]), float(row["gamma"]))
-        for row in policy_rows
-        if row.get("cohort") == "primary"
-    })
-    tau_variants = [f"tau={float(value):g}" for value in config["sampling"]["confidence_thresholds"]]
-    for dimension_index, (cohort, pool_size, gamma) in enumerate(dimensions):
-        universe = [
-            row
-            for row in policy_rows
-            if str(row["cohort"]) == cohort and int(row["requested_pool_size"]) == pool_size and float(row["gamma"]) == gamma
+    groups: dict[tuple[str, int | None], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in step_rows:
+        groups[(str(row["policy"]), row.get("candidate_k"))].append(row)
+    result: list[dict[str, Any]] = []
+    for (policy, candidate_k), rows in sorted(
+        groups.items(), key=lambda item: (item[0][0], -1 if item[0][1] is None else int(item[0][1]))
+    ):
+        sizes = [float(row["actual_commit_set_size"]) for row in rows]
+        full_pass = [
+            float(bool(row["full_candidate_set_certificate_pass"]))
+            for row in rows
+            if row.get("full_candidate_set_certificate_pass") is not None
         ]
-        by_policy: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-        for row in universe:
-            by_policy[str(row["policy"])].append(row)
-        comparisons = (
-            (POLICY_EXTENSION, "preserving_extension_B_pass_only"),
-            (POLICY_FREE, "free_oracle_upper_bound_all_states"),
+        effective = [
+            float(row["effective_candidate_k"])
+            for row in rows
+            if _finite_float(row.get("effective_candidate_k")) is not None
+        ]
+        result.append({
+            "policy": policy,
+            "candidate_k": candidate_k,
+            "action_step_count": len(rows),
+            "actual_commit_set_size_mean": math.fsum(sizes) / len(sizes) if sizes else None,
+            "actual_commit_set_size_median": _descriptive_quantile(sizes, 0.5),
+            "actual_commit_set_size_q25": _descriptive_quantile(sizes, 0.25),
+            "actual_commit_set_size_q75": _descriptive_quantile(sizes, 0.75),
+            "actual_commit_set_size_min": min(sizes) if sizes else None,
+            "actual_commit_set_size_max": max(sizes) if sizes else None,
+            "effective_candidate_k_mean": math.fsum(effective) / len(effective) if effective else None,
+            "full_topk_certificate_pass_rate": math.fsum(full_pass) / len(full_pass) if full_pass else None,
+        })
+    return result
+
+
+def agreement_rows(
+    baseline_results: Sequence[RolloutResult], oracle_results: Sequence[RolloutResult]
+) -> list[dict[str, Any]]:
+    baseline_by_prompt = {result.prompt_id: result for result in baseline_results}
+    result: list[dict[str, Any]] = []
+    for oracle in oracle_results:
+        baseline = baseline_by_prompt.get(oracle.prompt_id)
+        if baseline is None:
+            continue
+        raw_agreement = final_token_agreement(
+            baseline.final_generation_token_ids, oracle.final_generation_token_ids
         )
-        for oracle_policy, scope_name in comparisons:
-            oracle_states = [row for row in by_policy.get(oracle_policy, ()) if row.get("selected_size") is not None]
-            state_scope = {
-                (str(row["state_key"]), str(row["cohort"]), int(row["requested_pool_size"]), float(row["gamma"]))
-                for row in oracle_states
-            }
-            if not state_scope:
-                continue
-            for risk_index, risk_unit in enumerate(matching["risk_units"]):
-                for budget_index, risk_budget in enumerate(float(value) for value in matching["risk_budgets"]):
-                    candidates: list[tuple[float, float, str, dict[str, Any]]] = []
-                    for variant in tau_variants:
-                        risk_rows, risk_field = _match_metric_rows(
-                            policy_rows,
-                            token_rows,
-                            state_scope=state_scope,
-                            policy=POLICY_CONFIDENCE,
-                            variant=variant,
-                            partition="calibration",
-                            risk_unit=str(risk_unit),
-                        )
-                        risk = _metric_stats(
-                            risk_rows,
-                            field=risk_field,
-                            iterations=iterations,
-                            seed=seed + dimension_index * 101 + risk_index * 17 + budget_index,
-                        )
-                        capacity_rows = _rows_for_match(
-                            policy_rows,
-                            state_scope,
-                            policy=POLICY_CONFIDENCE,
-                            variant=variant,
-                            partition="calibration",
-                        )
-                        capacity = _metric_stats(
-                            capacity_rows,
-                            field="selected_size",
-                            iterations=iterations,
-                            seed=seed + dimension_index * 101 + risk_index * 17 + budget_index + 1,
-                        )
-                        risk_estimate = risk.get("prompt_macro_estimate")
-                        capacity_estimate = capacity.get("prompt_macro_estimate")
-                        if risk_estimate is None or capacity_estimate is None or float(risk_estimate) > risk_budget:
-                            continue
-                        try:
-                            tau = float(variant.removeprefix("tau="))
-                        except ValueError:
-                            continue
-                        candidates.append((float(capacity_estimate), tau, variant, {"risk": risk, "capacity": capacity}))
-                    base = {
-                        "cohort": cohort,
-                        "requested_pool_size": pool_size,
-                        "gamma": gamma,
-                        "oracle_policy": oracle_policy,
-                        "oracle_scope": scope_name,
-                        "risk_unit": risk_unit,
-                        "risk_budget": risk_budget,
-                        "calibration_prompt_disjoint": True,
-                        "calibration_state_count": len(_rows_for_match(policy_rows, state_scope, policy=oracle_policy, partition="calibration")),
-                        "test_state_count": len(_rows_for_match(policy_rows, state_scope, policy=oracle_policy, partition="test")),
-                    }
-                    if not candidates:
-                        output.append({**base, "status": "no_confidence_threshold_met_calibration_risk_budget", "selected_confidence_threshold": None})
-                        continue
-                    # Max capacity, then lower tau (more transparent/less arbitrary) if tied.
-                    capacity_value, tau, variant, calibration = sorted(candidates, key=lambda item: (-item[0], item[1]))[0]
-                    confidence_test_risk_rows, confidence_risk_field = _match_metric_rows(
-                        policy_rows,
-                        token_rows,
-                        state_scope=state_scope,
-                        policy=POLICY_CONFIDENCE,
-                        variant=variant,
-                        partition="test",
-                        risk_unit=str(risk_unit),
-                    )
-                    oracle_test_risk_rows, oracle_risk_field = _match_metric_rows(
-                        policy_rows,
-                        token_rows,
-                        state_scope=state_scope,
-                        policy=oracle_policy,
-                        variant=None,
-                        partition="test",
-                        risk_unit=str(risk_unit),
-                    )
-                    confidence_test_capacity_rows = _rows_for_match(
-                        policy_rows, state_scope, policy=POLICY_CONFIDENCE, variant=variant, partition="test"
-                    )
-                    oracle_test_capacity_rows = _rows_for_match(
-                        policy_rows, state_scope, policy=oracle_policy, partition="test"
-                    )
-                    paired_capacity_rows = _paired_commit_delta_rows(
-                        oracle_test_capacity_rows, confidence_test_capacity_rows
-                    )
-                    offset = dimension_index * 1000 + risk_index * 100 + budget_index * 10
-                    output.append({
-                        **base,
-                        "status": "selected_on_calibration_evaluated_on_prompt_disjoint_test",
-                        "selected_confidence_threshold": tau,
-                        "selected_confidence_variant": variant,
-                        "calibration_confidence_risk": calibration["risk"].get("prompt_macro_estimate"),
-                        "calibration_confidence_mean_commit_count": capacity_value,
-                        **{
-                            f"confidence_test_risk_{key}": value
-                            for key, value in _metric_stats(
-                                confidence_test_risk_rows, field=confidence_risk_field, iterations=iterations, seed=seed + offset + 2
-                            ).items()
-                        },
-                        **{
-                            f"oracle_test_risk_{key}": value
-                            for key, value in _metric_stats(
-                                oracle_test_risk_rows, field=oracle_risk_field, iterations=iterations, seed=seed + offset + 3
-                            ).items()
-                        },
-                        **{
-                            f"confidence_test_commit_count_{key}": value
-                            for key, value in _metric_stats(
-                                confidence_test_capacity_rows, field="selected_size", iterations=iterations, seed=seed + offset + 4
-                            ).items()
-                        },
-                        **{
-                            f"oracle_test_commit_count_{key}": value
-                            for key, value in _metric_stats(
-                                oracle_test_capacity_rows, field="selected_size", iterations=iterations, seed=seed + offset + 5
-                            ).items()
-                        },
-                        "heldout_paired_capacity_state_count": len(paired_capacity_rows),
-                        **{
-                            f"heldout_paired_oracle_minus_confidence_commit_count_{key}": value
-                            for key, value in _metric_stats(
-                                paired_capacity_rows,
-                                field="oracle_minus_confidence_commit_count",
-                                iterations=iterations,
-                                seed=seed + offset + 6,
-                            ).items()
-                        },
-                        **{
-                            f"heldout_paired_oracle_strictly_more_commits_rate_{key}": value
-                            for key, value in _metric_stats(
-                                paired_capacity_rows,
-                                field="oracle_strictly_more_commits_than_confidence",
-                                iterations=iterations,
-                                seed=seed + offset + 7,
-                            ).items()
-                        },
-                    })
+        both_completed = bool(baseline.completed and oracle.completed)
+        primary_agreement = raw_agreement if both_completed else {
+            **raw_agreement,
+            "compared_token_count": 0,
+            "matching_token_count": 0,
+            "token_position_agreement": None,
+            "final_sequence_exact_match": None,
+        }
+        result.append({
+            "prompt_id": oracle.prompt_id,
+            "dataset": oracle.dataset,
+            "example_id": oracle.example_id,
+            "baseline_policy": baseline.policy,
+            "baseline_forward_convention": baseline.forward_convention,
+            "candidate_k": oracle.candidate_k,
+            "baseline_completed": baseline.completed,
+            "oracle_completed": oracle.completed,
+            "both_completed": both_completed,
+            "agreement_status": (
+                "included_both_completed"
+                if both_completed
+                else "excluded_incomplete_rollout_from_primary_agreement"
+            ),
+            "raw_compared_token_count": raw_agreement["compared_token_count"],
+            "raw_matching_token_count": raw_agreement["matching_token_count"],
+            "raw_token_position_agreement": raw_agreement["token_position_agreement"],
+            "raw_final_sequence_exact_match": raw_agreement["final_sequence_exact_match"],
+            **primary_agreement,
+        })
+    return result
+
+
+def agreement_summary(
+    rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    iterations = int(config["reporting"]["clustered_bootstrap_replicates"])
+    seed = int(config["reporting"]["bootstrap_seed"])
+    groups: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        if row.get("candidate_k") is not None:
+            groups[(str(row.get("baseline_policy")), int(row["candidate_k"]))].append(row)
+    output: list[dict[str, Any]] = []
+    for offset, ((baseline_policy, candidate_k), members) in enumerate(sorted(groups.items())):
+        eligible = [row for row in members if bool(row.get("both_completed"))]
+        matching = sum(int(row["matching_token_count"]) for row in eligible)
+        compared = sum(int(row["compared_token_count"]) for row in eligible)
+        summary: dict[str, Any] = {
+            "baseline_policy": baseline_policy,
+            "candidate_k": candidate_k,
+            "paired_prompt_count": len(members),
+            "both_completed_prompt_count": sum(bool(row.get("both_completed")) for row in members),
+            "agreement_eligible_prompt_count": len(eligible),
+            "micro_token_position_agreement": matching / compared if compared else None,
+        }
+        _attach_metric(
+            summary,
+            "final_sequence_exact_match",
+            members,
+            field="final_sequence_exact_match",
+            iterations=iterations,
+            seed=seed + 101 + offset,
+        )
+        _attach_metric(
+            summary,
+            "token_position_agreement",
+            members,
+            field="token_position_agreement",
+            iterations=iterations,
+            seed=seed + 201 + offset,
+        )
+        _attach_metric(
+            summary,
+            "both_completed",
+            members,
+            field="both_completed",
+            iterations=iterations,
+            seed=seed + 301 + offset,
+        )
+        output.append(summary)
     return output
-
-
-def _summary_lookup(
-    summary_rows: Sequence[Mapping[str, Any]],
-    *,
-    cohort: str,
-    pool_size: int,
-    gamma: float,
-    policy: str,
-    variant: str | None = None,
-    scope: str = "all_eligible",
-) -> Mapping[str, Any] | None:
-    for row in summary_rows:
-        if (
-            row.get("scope") == scope
-            and row.get("cohort") == cohort
-            and int(row.get("requested_pool_size", -1)) == int(pool_size)
-            and float(row.get("gamma", math.nan)) == float(gamma)
-            and row.get("policy") == policy
-            and str(row.get("policy_variant") or "") == str(variant or "")
-        ):
-            return row
-    return None
 
 
 def _fmt_rate(value: Any) -> str:
-    number = _finite_float(value)
-    return "unavailable" if number is None else f"{100.0 * number:.2f}%"
+    numeric = _finite_float(value)
+    return "unavailable" if numeric is None else f"{numeric * 100.0:.2f}%"
 
 
 def _fmt_value(value: Any, digits: int = 3) -> str:
-    number = _finite_float(value)
-    return "unavailable" if number is None else f"{number:.{digits}f}"
+    numeric = _finite_float(value)
+    return "unavailable" if numeric is None else f"{numeric:.{digits}f}"
 
 
-def headroom_decision(
-    summary_rows: Sequence[Mapping[str, Any]], matched_rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any]
-) -> dict[str, Any]:
-    """Apply the predeclared GO/NO-GO rule, including held-out matching."""
-
-    target_m = max(int(value) for value in config["sampling"]["pool_sizes"])
-    row = _summary_lookup(
-        summary_rows,
-        cohort="primary",
-        pool_size=target_m,
-        gamma=0.0,
-        policy=POLICY_EXTENSION,
+def _summary_row(
+    rows: Sequence[Mapping[str, Any]], policy: str, candidate_k: int | None
+) -> Mapping[str, Any] | None:
+    return next(
+        (
+            row
+            for row in rows
+            if str(row.get("policy")) == policy and row.get("candidate_k") == candidate_k
+        ),
+        None,
     )
-    core_risk_unit = str(config["matching"]["core_risk_unit"])
-    core_risk_budget = float(config["matching"]["core_risk_budget"])
-    criterion = (
-        "GO only if (a) the primary M=max, gamma=0 preserving-extension result has strictly positive "
-        "prompt-clustered 95% lower bounds for both conditional safe added capacity and unconditional "
-        "state-level safe-extra coverage; and (b) its calibration-chosen, prompt-disjoint held-out "
-        "oracle-minus-confidence commit-count delta has a strictly positive 95% lower bound while both "
-        f"reported exact {core_risk_unit} rates are at most the predeclared {core_risk_budget:g} budget."
-    )
-    if row is None:
-        return {
-            "decision": "NO_GO_INSUFFICIENT_ELIGIBLE_PRIMARY_EVIDENCE",
-            "criterion": criterion,
-            "reason": "No eligible primary preserving-extension row exists at the largest requested pool size.",
-        }
-    capacity_low = _finite_float(row.get("safe_added_capacity_conditional_on_B_pass_prompt_clustered_ci95_low"))
-    coverage_low = _finite_float(row.get("state_has_at_least_one_safe_extra_prompt_clustered_ci95_low"))
-    matched = [
-        row
-        for row in matched_rows
-        if row.get("status") == "selected_on_calibration_evaluated_on_prompt_disjoint_test"
-        and row.get("cohort") == "primary"
-        and int(row.get("requested_pool_size", -1)) == target_m
-        and float(row.get("gamma", math.nan)) == 0.0
-        and row.get("oracle_policy") == POLICY_EXTENSION
-        and row.get("risk_unit") == core_risk_unit
-        and float(row.get("risk_budget", math.nan)) == core_risk_budget
-    ]
-    if not matched:
-        return {
-            "decision": "NO_GO_NO_PROMPT_DISJOINT_MATCHED_CONFIDENCE_EVIDENCE",
-            "criterion": criterion,
-            "reason": "No calibration-selected confidence threshold produced an evaluable prompt-disjoint held-out comparison at the core risk budget.",
-            "safe_added_capacity_ci95_low": capacity_low,
-            "safe_extra_coverage_ci95_low": coverage_low,
-        }
-    matched_row = matched[0]
-    delta_low = _finite_float(matched_row.get("heldout_paired_oracle_minus_confidence_commit_count_prompt_clustered_ci95_low"))
-    confidence_risk = _finite_float(matched_row.get("confidence_test_risk_prompt_macro_estimate"))
-    oracle_risk = _finite_float(matched_row.get("oracle_test_risk_prompt_macro_estimate"))
-    if (
-        capacity_low is not None
-        and coverage_low is not None
-        and delta_low is not None
-        and confidence_risk is not None
-        and oracle_risk is not None
-        and capacity_low > 0.0
-        and coverage_low > 0.0
-        and delta_low > 0.0
-        and confidence_risk <= core_risk_budget
-        and oracle_risk <= core_risk_budget
-    ):
-        return {
-            "decision": "GO_EXACT_ORACLE_EVIDENCE_OF_POSITIVE_SAFE_HEADROOM",
-            "criterion": criterion,
-            "reason": "Primary headroom and the paired held-out exact-oracle advantage over confidence-only selection both clear the predeclared direction-only rule. This supports only the exact-oracle direction, not deployment speed.",
-            "safe_added_capacity_ci95_low": capacity_low,
-            "safe_extra_coverage_ci95_low": coverage_low,
-            "heldout_paired_oracle_minus_confidence_commit_count_ci95_low": delta_low,
-            "heldout_confidence_risk": confidence_risk,
-            "heldout_oracle_risk": oracle_risk,
-        }
-    return {
-        "decision": "NO_GO_NO_ROBUST_POSITIVE_SAFE_HEADROOM",
-        "criterion": criterion,
-        "reason": "Primary safe-headroom evidence, the held-out paired confidence comparison, or exact risk matching did not clear the predeclared rule; do not mask this negative/inconclusive core result with upper-bound analyses.",
-        "safe_added_capacity_ci95_low": capacity_low,
-        "safe_extra_coverage_ci95_low": coverage_low,
-        "heldout_paired_oracle_minus_confidence_commit_count_ci95_low": delta_low,
-        "heldout_confidence_risk": confidence_risk,
-        "heldout_oracle_risk": oracle_risk,
-    }
 
 
-def _plot_or_empty(axis: Any, message: str) -> None:
-    axis.text(.5, .5, message, ha="center", va="center", transform=axis.transAxes)
-    axis.set_xticks([])
-    axis.set_yticks([])
+def _policy_display_label(policy: Any, candidate_k: Any) -> str:
+    if str(policy) == NATIVE_FAST_POLICY:
+        return "Fast tau=.8 native"
+    if str(policy) == FAST_POLICY:
+        return "Fast tau=.8 matched"
+    if candidate_k is not None:
+        return f"Exact K={candidate_k}"
+    return str(policy)
 
 
 def write_figures(
     output_dir: Path,
     *,
-    summary_rows: Sequence[Mapping[str, Any]],
-    policy_rows: Sequence[Mapping[str, Any]],
-    accounting: ForwardAccounting,
-    config: Mapping[str, Any],
+    throughput_rows: Sequence[Mapping[str, Any]],
+    batch_rows: Sequence[Mapping[str, Any]],
+    agreement_rows_: Sequence[Mapping[str, Any]],
 ) -> list[str]:
-    """Write compact capacity/risk and cost figures from exact scalar outputs."""
+    """Compact figures; data tables remain the authoritative numerical record."""
 
-    import matplotlib
+    try:
+        import matplotlib
 
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return []
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
 
-    def save(name: str) -> None:
-        path = output_dir / name
-        plt.tight_layout()
-        plt.savefig(path, dpi=180)
-        plt.close()
-        paths.append(str(path))
-
-    # The requested capacity-vs-exact-risk frontier.  Both axes carry prompt
-    # clustered CIs; the free policy is visibly labelled as an upper bound.
-    target_m = max(int(value) for value in config["sampling"]["pool_sizes"])
-    frontier = [
-        row
-        for row in summary_rows
-        if row.get("scope") == "all_eligible"
-        and row.get("cohort") == "primary"
-        and int(row.get("requested_pool_size", -1)) == target_m
-        and float(row.get("gamma", math.nan)) == 0.0
-        and row.get("policy") in {POLICY_FAST, POLICY_EXTENSION, POLICY_FREE, POLICY_CONFIDENCE}
+    labels = [_policy_display_label(row.get("policy"), row.get("candidate_k")) for row in throughput_rows]
+    values = [
+        _finite_float(row.get("aggregate_verification_aware_throughput_tokens_per_second")) or 0.0
+        for row in throughput_rows
     ]
-    plt.figure(figsize=(7.4, 5.2))
-    axis = plt.gca()
-    if frontier:
-        styles = {
-            POLICY_FAST: ("#2563eb", "o", "Fast-dLLM actual"),
-            POLICY_EXTENSION: ("#16a34a", "s", "VCCC preserving extension"),
-            POLICY_FREE: ("#9333ea", "^", "VCCC free (upper bound only)"),
-            POLICY_CONFIDENCE: ("#ea580c", ".", "confidence-only tau sweep"),
-        }
-        seen: set[str] = set()
-        for row in frontier:
-            risk = _finite_float(row.get("batch_failure_prompt_macro_estimate"))
-            capacity = _finite_float(row.get("committed_tokens_prompt_macro_estimate"))
-            if risk is None or capacity is None:
-                continue
-            policy = str(row["policy"])
-            color, marker, label = styles[policy]
-            xlow = _finite_float(row.get("batch_failure_prompt_clustered_ci95_low"))
-            xhigh = _finite_float(row.get("batch_failure_prompt_clustered_ci95_high"))
-            ylow = _finite_float(row.get("committed_tokens_prompt_clustered_ci95_low"))
-            yhigh = _finite_float(row.get("committed_tokens_prompt_clustered_ci95_high"))
-            axis.errorbar(
-                risk,
-                capacity,
-                xerr=[[max(0.0, risk - (xlow if xlow is not None else risk))], [max(0.0, (xhigh if xhigh is not None else risk) - risk)]],
-                yerr=[[max(0.0, capacity - (ylow if ylow is not None else capacity))], [max(0.0, (yhigh if yhigh is not None else capacity) - capacity)]],
-                fmt=marker,
-                markersize=6,
-                color=color,
-                alpha=.8,
-                label=label if policy not in seen else None,
-            )
-            seen.add(policy)
-        axis.set_xlabel("exact all-order batch failure rate (prompt macro; 95% CI)")
-        axis.set_ylabel("committed current-top-1 tokens / state (prompt macro; 95% CI)")
-        axis.set_title(f"Exact safe-commit capacity vs reversal risk (primary, M={target_m}, gamma=0)")
-        axis.legend(fontsize=8)
-    else:
-        _plot_or_empty(axis, "No eligible primary M=max gamma=0 frontier rows")
-    save("safe_commit_capacity_vs_exact_reversal_risk.png")
+    figure, axis = plt.subplots(figsize=(7, 4))
+    axis.bar(labels, values, color=["#2563eb" if label.startswith("Fast") else "#dc2626" for label in labels])
+    axis.set_ylabel("generated positions / second")
+    axis.set_title("Verification-aware throughput")
+    figure.tight_layout()
+    path = output_dir / "verification_aware_throughput.png"
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+    paths.append(str(path))
 
-    plt.figure(figsize=(7.4, 5.2))
-    axis = plt.gca()
-    if frontier:
-        styles = {
-            POLICY_FAST: ("#2563eb", "o", "Fast-dLLM actual"),
-            POLICY_EXTENSION: ("#16a34a", "s", "VCCC preserving extension"),
-            POLICY_FREE: ("#9333ea", "^", "VCCC free (upper bound only)"),
-            POLICY_CONFIDENCE: ("#ea580c", ".", "confidence-only tau sweep"),
-        }
-        seen: set[str] = set()
-        for row in frontier:
-            risk = _finite_float(row.get("token_violation_prompt_macro_estimate"))
-            capacity = _finite_float(row.get("committed_tokens_prompt_macro_estimate"))
-            if risk is None or capacity is None:
-                continue
-            policy = str(row["policy"])
-            color, marker, label = styles[policy]
-            xlow = _finite_float(row.get("token_violation_prompt_clustered_ci95_low"))
-            xhigh = _finite_float(row.get("token_violation_prompt_clustered_ci95_high"))
-            ylow = _finite_float(row.get("committed_tokens_prompt_clustered_ci95_low"))
-            yhigh = _finite_float(row.get("committed_tokens_prompt_clustered_ci95_high"))
-            axis.errorbar(
-                risk,
-                capacity,
-                xerr=[[max(0.0, risk - (xlow if xlow is not None else risk))], [max(0.0, (xhigh if xhigh is not None else risk) - risk)]],
-                yerr=[[max(0.0, capacity - (ylow if ylow is not None else capacity))], [max(0.0, (yhigh if yhigh is not None else capacity) - capacity)]],
-                fmt=marker,
-                markersize=6,
-                color=color,
-                alpha=.8,
-                label=label if policy not in seen else None,
-            )
-            seen.add(policy)
-        axis.set_xlabel("exact all-order token violation rate (prompt macro; 95% CI)")
-        axis.set_ylabel("committed current-top-1 tokens / state (prompt macro; 95% CI)")
-        axis.set_title(f"Exact safe-commit capacity vs token violation risk (primary, M={target_m}, gamma=0)")
-        axis.legend(fontsize=8)
-    else:
-        _plot_or_empty(axis, "No eligible primary M=max gamma=0 frontier rows")
-    save("safe_commit_capacity_vs_exact_token_violation_risk.png")
+    labels = [_policy_display_label(row.get("policy"), row.get("candidate_k")) for row in batch_rows]
+    values = [_finite_float(row.get("actual_commit_set_size_mean")) or 0.0 for row in batch_rows]
+    figure, axis = plt.subplots(figsize=(7, 4))
+    axis.bar(labels, values, color=["#2563eb" if label.startswith("Fast") else "#7c3aed" for label in labels])
+    axis.set_ylabel("mean actual commits / action step")
+    axis.set_title("Actual commit-set size")
+    figure.tight_layout()
+    path = output_dir / "commit_set_size.png"
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+    paths.append(str(path))
 
-    # Distribution makes it easy to distinguish a few large gains from broad
-    # state-level headroom.
-    distribution = [
-        row
-        for row in policy_rows
-        if row.get("cohort") == "primary"
-        and int(row.get("requested_pool_size", -1)) == target_m
-        and float(row.get("gamma", math.nan)) == 0.0
-        and row.get("policy") in {POLICY_FAST, POLICY_EXTENSION, POLICY_FREE}
-        and row.get("selected_size") is not None
-    ]
-    plt.figure(figsize=(7.0, 4.6))
-    axis = plt.gca()
-    labels = []
-    values = []
-    for policy, label in (
-        (POLICY_FAST, "Fast-dLLM B"),
-        (POLICY_EXTENSION, "preserving B+T*"),
-        (POLICY_FREE, "free exact upper bound"),
-    ):
-        selected = [float(row["selected_size"]) for row in distribution if row.get("policy") == policy]
-        if selected:
-            labels.append(label)
-            values.append(selected)
-    if values:
-        axis.boxplot(values, tick_labels=labels, showmeans=True)
-        axis.set_ylabel("committed tokens per selected state")
-        axis.set_title(f"Exact set-size distribution (primary, M={target_m}, gamma=0)")
-        axis.tick_params(axis="x", labelrotation=12)
-    else:
-        _plot_or_empty(axis, "No selected set-size rows")
-    save("exact_oracle_set_size_distribution.png")
-
-    extras = [
-        float(row["safe_added_capacity"])
-        for row in policy_rows
-        if row.get("cohort") == "primary"
-        and int(row.get("requested_pool_size", -1)) == target_m
-        and float(row.get("gamma", math.nan)) == 0.0
-        and row.get("policy") == POLICY_EXTENSION
-        and row.get("safe_added_capacity") is not None
-    ]
-    plt.figure(figsize=(6.4, 4.4))
-    axis = plt.gca()
-    if extras:
-        bins = list(range(0, max(int(value) for value in extras) + 2))
-        axis.hist(extras, bins=bins, align="left", rwidth=.8, color="#16a34a")
-        axis.set_xticks(bins[:-1])
-        axis.set_xlabel("safe added positions |T*|, conditional on B passing")
-        axis.set_ylabel("selected states")
-        axis.set_title("Preserving-extension headroom distribution")
-    else:
-        _plot_or_empty(axis, "No base-passing preserving-extension states")
-    save("preserving_extension_safe_extra_distribution.png")
-
-    plt.figure(figsize=(6.6, 4.2))
-    axis = plt.gca()
-    exact_contexts = accounting.subset_context_forwards
-    axis.bar(["fresh base\nforwards", "subset-context\nverification forwards"], [accounting.base_forwards, exact_contexts], color=["#2563eb", "#dc2626"])
-    axis.set_ylabel("exact no-cache forwards")
-    axis.set_title("Oracle verification cost (not a decoder speedup)")
-    save("exact_oracle_verification_forward_cost.png")
+    labels = [f"K={row['candidate_k']}" for row in agreement_rows_]
+    values = [_finite_float(row.get("token_position_agreement_prompt_macro_estimate")) or 0.0 for row in agreement_rows_]
+    figure, axis = plt.subplots(figsize=(6, 4))
+    axis.bar(labels, values, color="#059669")
+    axis.set_ylim(0.0, 1.0)
+    axis.set_ylabel("prompt-macro agreement with native Fast tau=.8")
+    axis.set_title("Final generated-token agreement")
+    figure.tight_layout()
+    path = output_dir / "final_output_agreement.png"
+    figure.savefig(path, dpi=160)
+    plt.close(figure)
+    paths.append(str(path))
     return paths
 
 
 def write_report(
     output_root: Path,
     *,
-    pool_rows: Sequence[Mapping[str, Any]],
-    summary_rows: Sequence[Mapping[str, Any]],
-    matched_rows: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any],
+    throughput_rows: Sequence[Mapping[str, Any]],
+    batch_rows: Sequence[Mapping[str, Any]],
+    agreement_rows_: Sequence[Mapping[str, Any]],
     config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Human-readable direct answer with upper bounds kept separate."""
+    """Write the direct experimental answer with K strata kept separate."""
 
-    target_m = max(int(value) for value in config["sampling"]["pool_sizes"])
-    primary_pools = [row for row in pool_rows if row.get("cohort") == "primary"]
-    eligibility = {
-        m: [row for row in primary_pools if int(row.get("requested_pool_size", -1)) == m]
-        for m in (int(value) for value in config["sampling"]["pool_sizes"])
+    native_baseline = _summary_row(throughput_rows, NATIVE_FAST_POLICY, None)
+    matched_baseline = _summary_row(throughput_rows, FAST_POLICY, None)
+    batch_by_key = {
+        (str(row.get("policy")), row.get("candidate_k")): row for row in batch_rows
     }
-    fast = _summary_lookup(summary_rows, cohort="primary", pool_size=target_m, gamma=0.0, policy=POLICY_FAST)
-    extension = _summary_lookup(summary_rows, cohort="primary", pool_size=target_m, gamma=0.0, policy=POLICY_EXTENSION)
-    free = _summary_lookup(summary_rows, cohort="primary", pool_size=target_m, gamma=0.0, policy=POLICY_FREE)
-    decision = headroom_decision(summary_rows, matched_rows, config)
-    matched = [
-        row
-        for row in matched_rows
-        if int(row.get("requested_pool_size", -1)) == target_m
-        and float(row.get("gamma", math.nan)) == 0.0
-        and row.get("oracle_policy") == POLICY_EXTENSION
-        and row.get("risk_unit") == config["matching"]["core_risk_unit"]
-        and float(row.get("risk_budget", math.nan)) == float(config["matching"]["core_risk_budget"])
-        and row.get("status") == "selected_on_calibration_evaluated_on_prompt_disjoint_test"
-    ]
-    selected_match = matched[0] if matched else None
-    direct = {
-        "decision": decision,
-        "largest_pool_size": target_m,
-        "primary_pool_eligibility": {
-            str(m): {
-                "eligible": sum(row.get("pool_status") == "eligible" for row in rows),
-                "screened": len(rows),
-            }
-            for m, rows in eligibility.items()
-        },
-        "fast_dllm_actual": dict(fast) if fast is not None else None,
-        "preserving_extension": dict(extension) if extension is not None else None,
-        "free_upper_bound": dict(free) if free is not None else None,
-        "prompt_disjoint_matched_confidence": dict(selected_match) if selected_match is not None else None,
+    agreement_by_key = {
+        (str(row.get("baseline_policy")), int(row["candidate_k"])): row
+        for row in agreement_rows_
+    }
+    direct: dict[str, Any] = {
+        "selected_t0_prompt_seeds": metadata.get("validated_t0_seed_count"),
+        "baseline_threshold": config["fast_dllm_baseline"]["threshold"],
+        "native_fast_dllm_throughput_tokens_per_second": (
+            None
+            if native_baseline is None
+            else native_baseline.get("aggregate_verification_aware_throughput_tokens_per_second")
+        ),
+        "matched_fast_dllm_throughput_tokens_per_second": (
+            None
+            if matched_baseline is None
+            else matched_baseline.get("aggregate_verification_aware_throughput_tokens_per_second")
+        ),
+        "by_candidate_k": {},
     }
     lines = [
-        "# Exact top-1 VCCC oracle headroom audit",
+        "# Experiment 3: Exact VCCC oracle checking",
         "",
-        "## Core GO/NO-GO decision",
+        "## Direct answers",
         "",
-        f"**{decision['decision']}** — {decision['reason']}",
-        "",
-        decision["criterion"],
-        "",
-        "This decision is about whether an exponentially expensive **exact oracle** finds positive safe-parallelism headroom over the unchanged Fast-dLLM batch. It is not a deployment or wall-clock speed claim.",
-        "",
-        "## Direct answers (primary cohort, gamma=0)",
-        "",
-        f"The primary result uses the predeclared outcome-blind one-state-per-prompt sample (cap={config['sampling']['primary_prompt_cap']}); it is not a claim about every source trajectory state.",
-        "",
-        "1. Primary eligible state counts by requested pool size: " + "; ".join(
-            f"M={m}: {sum(row.get('pool_status') == 'eligible' for row in rows)}/{len(rows)}"
-            for m, rows in eligibility.items()
-        ) + ".",
-        "2. Fast-dLLM actual batch exact all-order failure rate at M=" + str(target_m) + ": " + (
-            _fmt_rate(fast.get("batch_failure_prompt_macro_estimate")) if fast else "unavailable"
-        ) + ".",
-        "3. Fast-dLLM-preserving extension: conditional mean safe additions |T*|=" + (
-            _fmt_value(extension.get("safe_added_capacity_conditional_on_B_pass_prompt_macro_estimate")) if extension else "unavailable"
-        ) + ", conditional median=" + (
-            _fmt_value(extension.get("median_safe_added_capacity_conditional_on_B_pass")) if extension else "unavailable"
-        ) + ", and unconditional states with at least one safe extra=" + (
-            _fmt_rate(extension.get("state_has_at_least_one_safe_extra_prompt_macro_estimate")) if extension else "unavailable"
-        ) + ". Base-batch certificate failures are explicit, not coded as zero additions.",
-        "4. Free exact VCCC oracle (upper bound only): mean commit count=" + (
-            _fmt_value(free.get("committed_tokens_prompt_macro_estimate")) if free else "unavailable"
-        ) + "; it may drop Fast-dLLM tokens and is never pooled with preserving-extension coverage.",
-        "5. Idealized main-decoding NFE proxy (assuming a future cheap predictor reproduced the selected batch): Fast-dLLM=" + (
-            _fmt_value(fast.get("ideal_main_decode_nfe_per_committed_token")) if fast else "unavailable"
-        ) + " main forwards/token, preserving extension=" + (
-            _fmt_value(extension.get("ideal_main_decode_nfe_per_committed_token")) if extension else "unavailable"
-        ) + ". Exact verification forwards remain separately counted below.",
+        "1. Selected identical t=0 prompt seeds: "
+        + str(metadata.get("validated_t0_seed_count", 0))
+        + " (the source trajectory is used only for prompt/provenance selection).",
+        "2. Native Fast-dLLM threshold=0.8 throughput (historical direct use_cache=True call, no past-key reuse): "
+        + _fmt_value(
+            None
+            if native_baseline is None
+            else native_baseline.get("aggregate_verification_aware_throughput_tokens_per_second")
+        )
+        + " generated positions/s; mean commits/action step="
+        + _fmt_value(
+            None if native_baseline is None else native_baseline.get("commits_per_step_prompt_macro_estimate")
+        )
+        + ".",
+        "3. The separately reported matched Fast-dLLM control uses use_cache=False only for output agreement with the exact oracle: throughput="
+        + _fmt_value(
+            None
+            if matched_baseline is None
+            else matched_baseline.get("aggregate_verification_aware_throughput_tokens_per_second")
+        )
+        + " generated positions/s. It is not the native Fast-dLLM throughput claim.",
+        "4. Conservative logical-work bound (if every action commits only one generated position): "
+        + str(metadata.get("worst_case_work_bounds", {}).get("maximum_all_policy_model_forwards"))
+        + " model forwards and "
+        + str(metadata.get("worst_case_work_bounds", {}).get("maximum_scalar_margin_queries"))
+        + " scalar certificate queries across this cohort. Actual work can be lower when a policy commits multiple positions.",
     ]
-    if selected_match is None:
-        lines.extend([
-            "6. Prompt-disjoint matched-risk confidence comparison: unavailable (no calibration threshold met the predeclared zero-risk budget with usable evidence).",
-        ])
-    else:
-        lines.extend([
-            "6. Prompt-disjoint matched-risk confidence comparison: tau="
-            + _fmt_value(selected_match.get("selected_confidence_threshold"), 3)
-            + ", held-out confidence batch risk="
-            + _fmt_rate(selected_match.get("confidence_test_risk_prompt_macro_estimate"))
-            + ", held-out confidence mean commits="
-            + _fmt_value(selected_match.get("confidence_test_commit_count_prompt_macro_estimate"))
-            + ", held-out exact preserving-oracle mean commits="
-            + _fmt_value(selected_match.get("oracle_test_commit_count_prompt_macro_estimate"))
-            + ", paired held-out oracle-minus-confidence mean commits="
-            + _fmt_value(selected_match.get("heldout_paired_oracle_minus_confidence_commit_count_prompt_macro_estimate"))
-            + " (95% lower="
-            + _fmt_value(selected_match.get("heldout_paired_oracle_minus_confidence_commit_count_prompt_clustered_ci95_low"))
-            + "). The threshold was selected on calibration prompts only.",
-        ])
+    for answer_index, candidate_k in enumerate(
+        (int(value) for value in config["exact_vccc_oracle"]["candidate_sizes"]), start=5
+    ):
+        throughput = _summary_row(throughput_rows, EXACT_POLICY, candidate_k)
+        batch = batch_by_key.get((EXACT_POLICY, candidate_k))
+        native_agreement = agreement_by_key.get((NATIVE_FAST_POLICY, candidate_k))
+        matched_agreement = agreement_by_key.get((FAST_POLICY, candidate_k))
+        direct["by_candidate_k"][str(candidate_k)] = {
+            "verification_aware_throughput_tokens_per_second": (
+                None if throughput is None else throughput.get("aggregate_verification_aware_throughput_tokens_per_second")
+            ),
+            "mean_actual_commit_set_size": (
+                None if batch is None else batch.get("actual_commit_set_size_mean")
+            ),
+            "full_topk_certificate_pass_rate": (
+                None if batch is None else batch.get("full_topk_certificate_pass_rate")
+            ),
+            "final_sequence_exact_match_prompt_macro": (
+                None
+                if native_agreement is None
+                else native_agreement.get("final_sequence_exact_match_prompt_macro_estimate")
+            ),
+            "token_position_agreement_prompt_macro": (
+                None
+                if native_agreement is None
+                else native_agreement.get("token_position_agreement_prompt_macro_estimate")
+            ),
+            "agreement_eligible_prompt_count": (
+                None if native_agreement is None else native_agreement.get("agreement_eligible_prompt_count")
+            ),
+            "matched_control_token_position_agreement_prompt_macro": (
+                None
+                if matched_agreement is None
+                else matched_agreement.get("token_position_agreement_prompt_macro_estimate")
+            ),
+        }
+        lines.append(
+            f"{answer_index}. Exact VCCC K={candidate_k}: verification-aware throughput="
+            + _fmt_value(
+                None if throughput is None else throughput.get("aggregate_verification_aware_throughput_tokens_per_second")
+            )
+            + " positions/s; mean actual commit set="
+            + _fmt_value(None if batch is None else batch.get("actual_commit_set_size_mean"))
+            + "; full top-K certificate pass="
+            + _fmt_rate(None if batch is None else batch.get("full_topk_certificate_pass_rate"))
+            + "; final-sequence match with native Fast tau=.8="
+            + _fmt_rate(
+                None
+                if native_agreement is None
+                else native_agreement.get("final_sequence_exact_match_prompt_macro_estimate")
+            )
+            + "; generated-token agreement with native Fast="
+            + _fmt_rate(
+                None
+                if native_agreement is None
+                else native_agreement.get("token_position_agreement_prompt_macro_estimate")
+            )
+            + "; completed-prompt agreement denominator="
+            + str(
+                None
+                if native_agreement is None
+                else native_agreement.get("agreement_eligible_prompt_count")
+            )
+            + "; matched no-cache control token agreement="
+            + _fmt_rate(
+                None
+                if matched_agreement is None
+                else matched_agreement.get("token_position_agreement_prompt_macro_estimate")
+            )
+            + "."
+        )
     lines.extend([
         "",
-        "## Interpretation boundary",
+        "## Protocol",
         "",
-        "Every selected position keeps its fresh exact current full-vocabulary top-1 token. For a selected set S, the certificate checks every target i in S under every revealed subset A of S minus i, using raw-logit margins, deterministic argmax, `use_cache=False`, and an inclusive margin threshold with an explicit tie rule. A logged subset/order is an all-order query witness, not an observed decoder trajectory.",
+        "At every Exact-VCCC state, only still-masked fixed generation slots are ranked by the fresh full-vocabulary FP32 probability margin p1-p2. P_K is the top min(K, remaining masks) positions, tied by physical position. Each candidate keeps its fresh deterministic current top-1 token.",
         "",
-        "Within one state, the M=4/6/8 pools are nested (B first, then deterministic fresh-confidence extras). The runner evaluates every subset of the largest eligible pool once, including the all-revealed no-target context, and smaller-M certificates read their exact prefix contexts from that same cache; it does not reuse a model KV cache or a past-key value.",
+        "For every A subset P_K, the runner performs an independent fixed-position no-cache full-vocabulary forward. A subset S passes only when every i in S retains its fixed top-1 under every A subset S minus {i}; gamma=0 is inclusive, but deterministic argmax must still match. The actual action is C_K, the maximum-cardinality passing S; ties use summed p1-p2 then sorted physical positions. Thus top-K constrains the exponential search but is not blindly committed.",
         "",
-        "The actual Fast-dLLM comparison batch B is read from the original threshold-plus-argmax-fallback policy. It is never recomputed from this audit's fresh exact forward. Any stored B token that differs from the fresh exact top-1 is excluded and logged. Confidence-only tau policies intentionally have no fallback, so they are a threshold frontier rather than a duplicate of B.",
+        "Fast-dLLM uses the normal p1>=0.8 action on its own trajectory and commits the first highest-confidence masked generation position only when no position reaches threshold. Its native throughput uses the historical direct `model(x, use_cache=True)` convention without past-key reuse. A separate matched Fast rollout uses fixed-position no-cache exact forwards so the final outputs can be compared fairly with Exact VCCC. Exact-VCCC throughput is committed generated positions divided by CUDA-synchronized rollout seconds and includes every subset verification forward; it is therefore an offline verification-aware measurement, not a deployable speed claim.",
         "",
-        "## Exact verification accounting",
-        "",
-        f"- Fresh base exact forwards: {metadata['forward_accounting']['base_forwards']}",
-        f"- Additional exact subset-context forwards: {metadata['forward_accounting']['subset_context_forwards']}",
-        f"- Total exact no-cache forwards: {metadata['forward_accounting']['exact_forwards']}; model batch calls: {metadata['forward_accounting']['model_batch_calls']}",
-        f"- Runtime seconds: {metadata['runtime_seconds']}; peak VRAM MiB: {metadata['peak_vram_mib']}",
+        "Final-output agreement compares terminal generated token IDs from the same prompt seed between Exact VCCC and native Fast-dLLM; both full-sequence exact match and position-wise Hamming agreement are reported. The matched no-cache Fast-control agreement is retained separately as a forward-convention diagnostic. Incomplete rollouts are explicitly retained in raw provenance but excluded from the primary agreement denominator. Intermediate action overlap is intentionally not interpreted after trajectories diverge.",
         "",
         "## Artifacts",
         "",
-        "- `raw/state_screening.jsonl`: outcome-blind selection and every fresh-replay exclusion.",
-        "- `tables/selection_accounting.csv` and `tables/exclusions.csv`: every source-screening, prompt-cap, fresh-replay, and M-stratum availability decision.",
-        "- `raw/subset_contexts.jsonl` and `raw/subset_margin_queries.jsonl`: one exact context record per subset and the full-vocabulary scalar margin queries.",
-        "- `tables/state_pool_selection.csv`: B, P, M-stratum eligibility, and common-eligible flags.",
-        "- `tables/policy_state_results.csv` and `tables/token_certificate_witnesses.csv`: policy certificates, selected tokens, violations, and query witnesses.",
-        "- `tables/headroom_summary.csv`, `tables/confidence_sweep.csv`, `tables/matched_risk_test.csv`, and `tables/oracle_cost.csv`: prompt-clustered estimates, prompt-disjoint frontier matching, and cost/NFE interpretation.",
+        "- raw/prompt_selection.jsonl: deterministic source prompt/t=0 seed screening.",
+        "- raw/policy_steps.jsonl: every actual Fast or Exact VCCC action, including candidate margins and committed set size.",
+        "- raw/exact_subset_contexts.jsonl and raw/exact_margin_queries.jsonl: every exact top-K subset context and scalar all-order query, appended after each prompt for interruption resilience.",
+        "- tables/throughput_summary.csv, tables/commit_batch_summary.csv, and tables/final_output_agreement.csv: requested throughput, actual batch sizes, and same-prompt final-output comparison.",
+        "",
+        "All confidence intervals are prompt-clustered. K=2, K=4, and K=8 are separate strata and are never pooled. `progress.json` records durable prompt-level progress while the audit is running.",
     ])
     (output_root / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return direct
@@ -1785,433 +1643,450 @@ def write_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=PROJECT_ROOT / "configs" / "exact_top1_vccc_oracle_headroom.yaml",
-    )
-    parser.add_argument("--probe-root", type=Path, default=PROJECT_ROOT)
-    parser.add_argument("--source-run", type=Path, required=True, help="Completed top1_dynamics_audit run directory (read-only).")
-    parser.add_argument("--output-root", type=Path, default=None)
-    parser.add_argument("--run-id", type=str, default=None)
-    parser.add_argument("--smoke", action="store_true", help="Run one outcome-blind primary state; never use it for the GO/NO-GO decision.")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--probe-root", type=Path, required=True)
+    parser.add_argument("--source-run", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path)
+    parser.add_argument("--run-id", type=str)
+    parser.add_argument("--smoke", action="store_true", help="Run one deterministic prompt seed.")
     return parser.parse_args()
 
 
-def make_output_root(base: Path, run_id: str | None, *, run_prefix: str) -> Path:
-    identifier = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    root = base / f"{run_prefix}{identifier}"
-    if root.exists():
-        raise FileExistsError(f"Refusing to overwrite existing exact headroom audit: {root}")
-    for name in ("raw", "tables", "figures"):
-        (root / name).mkdir(parents=True, exist_ok=False) if name == "raw" else (root / name).mkdir(parents=True, exist_ok=True)
+def make_output_root(base: Path, run_id: str | None, *, prefix: str) -> Path:
+    token = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    root = base / f"{prefix}{token}"
+    root.mkdir(parents=True, exist_ok=False)
+    for child in ("raw", "tables", "figures"):
+        (root / child).mkdir(parents=True, exist_ok=True)
     return root
 
 
-def _invalid_pool_row(state: SelectedState, requested_size: int, *, reason: str) -> dict[str, Any]:
+def worst_case_work_bounds(
+    generation_length: int, candidate_sizes: Sequence[int], prompt_count: int
+) -> dict[str, Any]:
+    """Logical bound when each policy action commits only one position.
+
+    This is deliberately a work-count bound, not a wall-clock prediction:
+    model batch size, sequence length, and adaptive OOM splitting determine
+    elapsed time. It makes the exponential K=8 cost visible before a full run.
+    """
+
+    per_k: dict[str, dict[str, int]] = {}
+    for requested_k in candidate_sizes:
+        contexts = 0
+        queries = 0
+        for remaining in range(int(generation_length), 0, -1):
+            effective_k = min(int(requested_k), remaining)
+            contexts += 1 << effective_k  # base + every nonempty subset
+            queries += effective_k * (1 << (effective_k - 1))
+        per_k[str(int(requested_k))] = {
+            "maximum_exact_forwards_per_prompt": contexts,
+            "maximum_scalar_margin_queries_per_prompt": queries,
+        }
+    fast_actions_per_prompt = int(generation_length)
+    exact_forwards_per_prompt = sum(
+        row["maximum_exact_forwards_per_prompt"] for row in per_k.values()
+    )
     return {
-        **_source_common(state),
-        "requested_pool_size": int(requested_size),
-        "pool_status": reason,
-        "effective_pool_size": None,
-        "actual_fast_dllm_size": None,
-        "actual_fast_dllm_positions": [],
-        "actual_fast_dllm_token_ids": [],
-        "pool_positions": [],
-        "pool_token_ids": [],
-        "pool_top1_probabilities": [],
-        "pool_extra_positions_ranked_by_fresh_confidence": [],
+        "assumption": "one actual commit per action step until all generated positions are revealed",
+        "prompt_count": int(prompt_count),
+        "native_fast_action_forwards_per_prompt": fast_actions_per_prompt,
+        "matched_fast_action_forwards_per_prompt": fast_actions_per_prompt,
+        "exact_by_candidate_k": per_k,
+        "maximum_exact_forwards_per_prompt": exact_forwards_per_prompt,
+        "maximum_all_policy_model_forwards_per_prompt": exact_forwards_per_prompt + 2 * fast_actions_per_prompt,
+        "maximum_all_policy_model_forwards": (
+            exact_forwards_per_prompt + 2 * fast_actions_per_prompt
+        ) * int(prompt_count),
+        "maximum_scalar_margin_queries": sum(
+            row["maximum_scalar_margin_queries_per_prompt"] for row in per_k.values()
+        ) * int(prompt_count),
     }
-
-
-def _check_source_manifest(source_manifest: Mapping[str, Any], config: Mapping[str, Any]) -> None:
-    allowed = {"completed", "observational_completed_exact_audit_blocked_resource_estimate"}
-    if source_manifest.get("status") not in allowed:
-        raise RuntimeError(f"Source run is not a completed top-1 evidence bundle: {source_manifest.get('status')!r}")
-    source_fast_commit = source_manifest.get("fast_dllm_requested_commit")
-    expected_fast_commit = config["model"]["fast_dllm_commit"]
-    if source_fast_commit is not None and str(source_fast_commit) != str(expected_fast_commit):
-        raise RuntimeError(
-            "Source run Fast-dLLM pin differs from the headroom audit config: "
-            f"source={source_fast_commit!r}, audit={expected_fast_commit!r}"
-        )
-    source_snapshot = source_manifest.get("model_snapshot")
-    if not isinstance(source_snapshot, Mapping):
-        raise RuntimeError("Source run lacks model_snapshot provenance required for frozen-model reuse.")
-    if str(source_snapshot.get("model_name")) != str(config["model"]["name"]):
-        raise RuntimeError("Source run model name differs from the exact headroom audit config.")
-    if str(source_snapshot.get("requested_hf_revision")) != str(config["model"]["hf_revision"]):
-        raise RuntimeError("Source run requested HF revision differs from the exact headroom audit config.")
-    semantics = source_manifest.get("decoder_semantics")
-    if not isinstance(semantics, Mapping):
-        raise RuntimeError("Source run lacks decoder_semantics provenance required for normal-policy reuse.")
-    if semantics.get("fallback_rule") != config["decoder_policy"]["fallback_rule"]:
-        raise RuntimeError("Source run fallback-rule provenance differs from the exact headroom audit config.")
-
-
-def _add_relative_nfe(summary_rows: list[dict[str, Any]]) -> None:
-    """Add an ideal policy-only NFE ratio; never include oracle forwards."""
-
-    baselines: dict[tuple[Any, ...], Mapping[str, Any]] = {}
-    for row in summary_rows:
-        if row.get("policy") == POLICY_FAST:
-            baselines[(
-                row.get("scope"), row.get("cohort"), row.get("requested_pool_size"), row.get("gamma"),
-            )] = row
-    for row in summary_rows:
-        baseline = baselines.get((
-            row.get("scope"), row.get("cohort"), row.get("requested_pool_size"), row.get("gamma"),
-        ))
-        current = _finite_float(row.get("ideal_commit_tokens_per_decode_step"))
-        baseline_count = _finite_float(baseline.get("ideal_commit_tokens_per_decode_step")) if baseline else None
-        if row.get("policy") == POLICY_EXTENSION:
-            # Extension is defined only where B passes.  Its proxy comparison
-            # must use B on precisely those same states rather than silently
-            # borrowing an all-state Fast-dLLM average.
-            baseline_count = _finite_float(
-                row.get("actual_fast_dllm_tokens_on_same_B_pass_states_prompt_macro_estimate")
-            )
-        row["ideal_main_decode_nfe_ratio_vs_fast_dllm"] = (
-            None if current is None or baseline_count is None or current <= 0.0 else baseline_count / current
-        )
-        row["ideal_nfe_proxy_assumption"] = (
-            "future cheap certificate predictor reproduces this policy's selected current-top1 set; "
-            "exponential exact verification forwards excluded"
-        )
 
 
 def main() -> None:
     args = parse_args()
-    wall_started = time.perf_counter()
+    started_at_utc = datetime.now(timezone.utc).isoformat()
+    runner_started = time.perf_counter()
     config = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     if not isinstance(config, Mapping):
-        raise ValueError("Headroom config must be a mapping")
+        raise ValueError("Exact VCCC oracle configuration must be a mapping.")
+    candidate_sizes = tuple(int(value) for value in config["exact_vccc_oracle"]["candidate_sizes"])
+    if candidate_sizes != tuple(sorted(set(candidate_sizes))) or any(value < 1 for value in candidate_sizes):
+        raise ValueError("exact_vccc_oracle.candidate_sizes must be ascending, unique positive K values.")
+    if int(config["decoding"]["max_steps"]) < int(config["decoding"]["generation_length"]):
+        raise ValueError("decoding.max_steps must allow every generation position to make progress.")
     probe_root = args.probe_root.resolve()
     source_root = args.source_run.resolve()
     source_manifest_path = source_root / "run_manifest.json"
     trajectories_path = source_root / "raw" / "trajectories.jsonl"
-    state_positions_path = source_root / "raw" / "state_positions.jsonl"
-    if not source_manifest_path.exists() or not trajectories_path.exists() or not state_positions_path.exists():
-        raise FileNotFoundError("Source run must contain run_manifest.json, raw/trajectories.jsonl, and raw/state_positions.jsonl")
+    if not source_manifest_path.exists() or not trajectories_path.exists():
+        raise FileNotFoundError("Source run must contain run_manifest.json and raw/trajectories.jsonl.")
     source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(source_manifest, Mapping):
+        raise ValueError("Source run_manifest.json must be an object.")
     _check_source_manifest(source_manifest, config)
     output_base = Path(args.output_root) if args.output_root else probe_root / str(config["storage"]["output_root"])
-    output_root = make_output_root(output_base, args.run_id, run_prefix=str(config["storage"]["run_prefix"]))
+    output_root = make_output_root(output_base, args.run_id, prefix=str(config["storage"]["run_prefix"]))
     shutil.copy2(args.config, output_root / "config.yaml")
     write_json(output_root / "source_manifest.json", source_manifest)
 
     trajectories = read_jsonl(trajectories_path)
-    original_policy_positions = natural_policy_rows_by_state(state_positions_path)
-    selected, screening_rows, source_selection_counts = select_states(trajectories, config, smoke=bool(args.smoke))
-    if not selected:
-        write_jsonl(output_root / "raw" / "state_screening.jsonl", screening_rows)
-        raise RuntimeError("No primary source states passed the outcome-blind source schema screen.")
+    seeds, screening_rows, source_selection_counts = select_prompt_seeds(
+        trajectories, config, smoke=bool(args.smoke)
+    )
+    if not seeds:
+        write_jsonl(output_root / "raw" / "prompt_selection.jsonl", screening_rows)
+        raise RuntimeError("No deterministic primary t=0 prompt seeds were available.")
 
     from scripts.collect_states import mask_token_id
     from scripts.run_top1_dynamics_audit import _model_snapshot_metadata, load_model
     import torch
 
-    model, tokenizer, _device = load_model(config, probe_root)
-    current_model_snapshot = _model_snapshot_metadata(model, tokenizer, config)
-    source_model_snapshot = source_manifest["model_snapshot"]
-    source_commit_hint = source_model_snapshot.get("resolved_hf_commit_hint")
-    current_commit_hint = current_model_snapshot.get("resolved_hf_commit_hint")
-    if source_commit_hint and current_commit_hint and str(source_commit_hint) != str(current_commit_hint):
+    model, tokenizer, _dtype = load_model(config, probe_root)
+    source_snapshot = source_manifest["model_snapshot"]
+    current_snapshot = _model_snapshot_metadata(model, tokenizer, config)
+    source_hint = source_snapshot.get("resolved_hf_commit_hint")
+    current_hint = current_snapshot.get("resolved_hf_commit_hint")
+    if source_hint and current_hint and str(source_hint) != str(current_hint):
         raise RuntimeError(
-            "The currently loaded Hugging Face snapshot differs from the source exact-trajectory snapshot: "
-            f"source={source_commit_hint!r}, current={current_commit_hint!r}"
+            "Current Hugging Face snapshot differs from source t=0 seeds: "
+            f"source={source_hint!r}, current={current_hint!r}"
         )
-    model_snapshot_replay_verification = {
-        "source": source_model_snapshot,
-        "current": current_model_snapshot,
+    snapshot_verification = {
+        "source": source_snapshot,
+        "current": current_snapshot,
         "status": (
             "resolved_commit_match"
-            if source_commit_hint and current_commit_hint and str(source_commit_hint) == str(current_commit_hint)
+            if source_hint and current_hint and str(source_hint) == str(current_hint)
             else "requested_revision_match_resolved_commit_hint_unavailable"
         ),
     }
     mask_id = mask_token_id(model, tokenizer)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-    accounting = ForwardAccounting(started=time.perf_counter())
-    requested_pool_sizes = tuple(int(value) for value in config["sampling"]["pool_sizes"])
-    if tuple(sorted(set(requested_pool_sizes))) != requested_pool_sizes:
-        raise ValueError("sampling.pool_sizes must be ascending and unique so nested forward reuse is valid")
-    all_pool_rows: list[dict[str, Any]] = []
-    all_base_rows: list[dict[str, Any]] = []
-    all_context_rows: list[dict[str, Any]] = []
-    all_query_rows: list[dict[str, Any]] = []
-    all_policy_rows: list[dict[str, Any]] = []
-    all_token_rows: list[dict[str, Any]] = []
-    tie_tolerance = float(config["certificate"]["tie_tolerance"])
-
-    for ordinal, state in enumerate(selected, 1):
-        record = state.record
-        common = _source_common(state)
-        try:
-            mask_positions_in_policy_order = [int(value) for value in record["mask_positions"]]
-            mask_positions = set(mask_positions_in_policy_order)
-        except (KeyError, TypeError, ValueError):
-            mask_positions_in_policy_order = []
-            mask_positions = set()
-        if not mask_positions or len(mask_positions) != len(mask_positions_in_policy_order):
-            reason = "fresh_replay_invalid_or_empty_mask_positions"
-            screening_rows.append({**common, "selection_stage": "fresh_exact_replay", "status": "excluded", "exclusion_reason": reason})
-            all_pool_rows.extend(_invalid_pool_row(state, m, reason=reason) for m in requested_pool_sizes)
-            continue
-        try:
-            base_input_ids = torch.tensor([record["token_sequence"]], device=next(model.parameters()).device, dtype=torch.long)
-        except (KeyError, TypeError, ValueError) as error:
-            reason = "fresh_replay_cannot_construct_input_ids"
-            screening_rows.append({**common, "selection_stage": "fresh_exact_replay", "status": "excluded", "exclusion_reason": reason, "detail": str(error)})
-            all_pool_rows.extend(_invalid_pool_row(state, m, reason=reason) for m in requested_pool_sizes)
-            continue
-        out_of_bounds = [position for position in mask_positions if position < 0 or position >= int(base_input_ids.shape[1])]
-        non_masked = [position for position in mask_positions if position not in out_of_bounds and int(base_input_ids[0, position].item()) != mask_id]
-        if out_of_bounds or non_masked:
-            reason = "fresh_replay_mask_position_out_of_bounds" if out_of_bounds else "fresh_replay_claimed_mask_is_not_mask_token"
+    validated_seeds: list[PromptSeed] = []
+    for seed in seeds:
+        error = _validate_t0_masks(seed, mask_token_id=mask_id)
+        if error is not None:
             screening_rows.append({
-                **common,
-                "selection_stage": "fresh_exact_replay",
-                "status": "excluded",
-                "exclusion_reason": reason,
-                "out_of_bounds_positions": out_of_bounds,
-                "non_masked_positions": non_masked,
+                "prompt_id": seed.prompt_id,
+                "dataset": seed.dataset,
+                "example_id": seed.example_id,
+                "state_key": seed.source_t0_state_key,
+                "selection_stage": "loaded_model_t0_mask_validation",
+                "status": "excluded_after_model_load",
+                "exclusion_reason": error,
             })
-            all_pool_rows.extend(_invalid_pool_row(state, m, reason=reason) for m in requested_pool_sizes)
-            del base_input_ids
             continue
-        base_logits = exact_logits_batched(model, base_input_ids)
-        accounting.base_forwards += 1
-        accounting.model_batch_calls += 1
-        assignments = _base_assignments(base_logits, mask_positions, tie_tolerance=tie_tolerance)
-        all_base_rows.extend({
-            **common,
-            "position": position,
-            "fresh_exact_top1_token_id": payload["token_id"],
-            "fresh_exact_top1_probability": payload["top1_probability"],
-            "fresh_exact_logit_margin": payload["logit_margin"],
-            "fresh_exact_top2_token_id": payload["top2_token_id"],
-            "fresh_exact_top2_probability": payload["top2_probability"],
-            "fresh_exact_top1_matches_assignment": payload["top1_matches_assignment"],
-            "fresh_exact_is_logit_tie": payload["is_logit_tie"],
-        } for position, payload in sorted(assignments.items()))
-        actual_positions, error = _validate_actual_batch(
-            state,
-            mask_positions=mask_positions,
-            mask_positions_in_policy_order=mask_positions_in_policy_order,
-            fresh_assignments=assignments,
-            natural_position_rows=original_policy_positions.get(str(record["state_key"])),
-            config=config,
-        )
-        if error is not None or actual_positions is None:
-            reason = error or "fresh_replay_unknown_actual_batch_error"
-            screening_rows.append({
-                **common,
-                "selection_stage": "fresh_exact_replay",
-                "status": "excluded",
-                "exclusion_reason": reason,
-                "actual_batch_fresh_token_mismatches": _actual_batch_fresh_token_mismatches(record, assignments),
-            })
-            all_pool_rows.extend(_invalid_pool_row(state, m, reason=reason) for m in requested_pool_sizes)
-            del base_logits, base_input_ids
-            continue
+        validated_seeds.append(seed)
         screening_rows.append({
-            **common,
-            "selection_stage": "fresh_exact_replay",
-            "status": "retained_after_fresh_exact_top1_validation",
+            "prompt_id": seed.prompt_id,
+            "dataset": seed.dataset,
+            "example_id": seed.example_id,
+            "state_key": seed.source_t0_state_key,
+            "selection_stage": "loaded_model_t0_mask_validation",
+            "status": "retained_t0_seed",
             "exclusion_reason": None,
-            "actual_fast_dllm_positions": actual_positions,
-            "actual_fast_dllm_size": len(actual_positions),
         })
-        eligible_pools: dict[int, dict[str, Any]] = {}
-        for pool_size in requested_pool_sizes:
-            pool_row, pool_error = _pool_for_stratum(
-                state,
-                actual_batch_positions=actual_positions,
-                assignments=assignments,
-                requested_size=pool_size,
-            )
-            all_pool_rows.append(pool_row)
-            if pool_error is None:
-                eligible_pools[pool_size] = pool_row
-        if not eligible_pools:
-            del base_logits, base_input_ids
-            print(json.dumps({"stage": "fresh_replay", "state": ordinal, "total_states": len(selected), "state_key": record["state_key"], "status": "no_eligible_pool", "forwards": accounting.exact_forwards}))
-            continue
-        max_pool_size, max_pool = max(eligible_pools.items(), key=lambda item: (int(item[1]["effective_pool_size"]), item[0]))
-        max_positions = [int(value) for value in max_pool["pool_positions"]]
-        max_tokens = [int(value) for value in max_pool["pool_token_ids"]]
-        for pool_size, pool in eligible_pools.items():
-            positions = [int(value) for value in pool["pool_positions"]]
-            if max_positions[: len(positions)] != positions:
-                raise RuntimeError(f"{record['state_key']}: nested M strata do not share the required B-plus-confidence pool prefix")
-        margins, context_rows, query_rows = _evaluate_max_pool_contexts(
-            model,
-            state,
-            base_input_ids=base_input_ids,
-            base_logits=base_logits,
-            pool_positions=max_positions,
-            pool_token_ids=max_tokens,
-            batch_size=int(config["execution"]["subset_batch_size"]),
-            tie_tolerance=tie_tolerance,
-            accounting=accounting,
-        )
-        all_context_rows.extend(context_rows)
-        all_query_rows.extend(query_rows)
-        for pool_size, pool in eligible_pools.items():
-            positions = [int(value) for value in pool["pool_positions"]]
-            tokens = [int(value) for value in pool["pool_token_ids"]]
-            probabilities = [float(value) for value in pool["pool_top1_probabilities"]]
-            policy_rows, token_rows = evaluate_policies_for_pool(
-                state,
-                requested_pool_size=pool_size,
-                positions=positions,
-                token_ids=tokens,
-                probabilities=probabilities,
-                actual_batch_positions=actual_positions,
-                margins=margins,
-                config=config,
-            )
-            all_policy_rows.extend(policy_rows)
-            all_token_rows.extend(token_rows)
-        del base_logits
-        print(json.dumps({
-            "stage": "subset_grid",
-            "state": ordinal,
-            "total_states": len(selected),
-            "state_key": record["state_key"],
-            "max_requested_pool_size": max_pool_size,
-            "max_effective_pool_size": len(max_positions),
-            "forwards": accounting.exact_forwards,
-        }))
+    if not validated_seeds:
+        write_jsonl(output_root / "raw" / "prompt_selection.jsonl", screening_rows)
+        raise RuntimeError("No selected t=0 seed retained the fixed generation-mask invariant.")
+    work_bounds = worst_case_work_bounds(
+        int(config["decoding"]["generation_length"]), candidate_sizes, len(validated_seeds)
+    )
 
-    required_pool_set = set(requested_pool_sizes)
-    eligible_by_state: dict[tuple[str, str], set[int]] = defaultdict(set)
-    for row in all_pool_rows:
-        if row.get("pool_status") == "eligible":
-            eligible_by_state[(str(row["state_key"]), str(row["cohort"]))].add(int(row["requested_pool_size"]))
-    common_eligible = {
-        key for key, pools in eligible_by_state.items() if pools == required_pool_set
+    # Exclude each forward convention's first lazy allocation/compile cost
+    # from policy timing. Both are read-only t=0 calls and are retained in
+    # provenance rather than silently folded into a throughput result.
+    warmup_input = torch.tensor(
+        [validated_seeds[0].token_sequence],
+        device=next(model.parameters()).device,
+        dtype=torch.long,
+    )
+    _sync_cuda(torch)
+    exact_warmup_started = time.perf_counter()
+    warmup_logits = exact_logits_batched(model, warmup_input)
+    _sync_cuda(torch)
+    exact_warmup_seconds = time.perf_counter() - exact_warmup_started
+    warmup_assignments = _base_assignments(
+        warmup_logits,
+        validated_seeds[0].generation_positions,
+        tie_tolerance=float(config["exact_vccc_oracle"]["tie_tolerance"]),
+    )
+    warmup_candidates = select_top_probability_margin_positions(
+        warmup_assignments,
+        min(max(candidate_sizes), len(warmup_assignments)),
+    )
+    reducer_validation = validate_vectorized_margin_reducer(
+        warmup_logits,
+        warmup_candidates,
+        tuple(int(warmup_assignments[position]["token_id"]) for position in warmup_candidates),
+        tie_tolerance=float(config["exact_vccc_oracle"]["tie_tolerance"]),
+    )
+    del warmup_logits
+    _sync_cuda(torch)
+    native_warmup_started = time.perf_counter()
+    warmup_logits = _native_fast_logits(model, warmup_input)
+    _sync_cuda(torch)
+    native_warmup_seconds = time.perf_counter() - native_warmup_started
+    del warmup_logits, warmup_input
+    if bool(torch.cuda.is_available()):
+        torch.cuda.reset_peak_memory_stats()
+
+    # The large raw certificate artifacts are committed prompt-by-prompt. A
+    # pod/session interruption therefore leaves inspectable evidence and a
+    # precise progress record instead of a single end-of-run serialization.
+    context_path = output_root / "raw" / "exact_subset_contexts.jsonl"
+    query_path = output_root / "raw" / "exact_margin_queries.jsonl"
+    policy_steps_path = output_root / "raw" / "policy_steps.jsonl"
+    prompt_rollouts_path = output_root / "raw" / "prompt_rollouts.jsonl"
+    agreement_path = output_root / "raw" / "final_output_agreement.jsonl"
+    for path in (context_path, query_path, policy_steps_path, prompt_rollouts_path, agreement_path):
+        append_jsonl(path, ())
+    raw_counts = {
+        "exact_subset_context_rows": 0,
+        "exact_margin_query_rows": 0,
+        "policy_step_rows": 0,
+        "prompt_rollout_rows": 0,
+        "final_output_agreement_rows": 0,
     }
-    for rows in (all_pool_rows, all_policy_rows, all_token_rows, all_context_rows, all_query_rows, all_base_rows):
-        for row in rows:
-            row["common_eligible_M4_M6_M8"] = (str(row.get("state_key")), str(row.get("cohort"))) in common_eligible
+    progress: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "status": "running",
+        "started_at_utc": started_at_utc,
+        "total_prompts": len(validated_seeds),
+        "completed_prompts": 0,
+        "worst_case_work_bounds": work_bounds,
+        "raw_row_counts": raw_counts,
+    }
+    write_json_atomic(output_root / "progress.json", progress)
+    write_jsonl(output_root / "raw" / "prompt_selection.jsonl", screening_rows)
 
-    summary_rows = summarize_policies(all_policy_rows, all_token_rows, config)
-    _add_relative_nfe(summary_rows)
-    sweep_rows = confidence_sweep_rows(summary_rows)
-    matched_rows = matched_risk_rows(all_policy_rows, all_token_rows, config)
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    all_steps: list[dict[str, Any]] = []
+    native_baseline_results: list[RolloutResult] = []
+    matched_baseline_results: list[RolloutResult] = []
+    oracle_results: list[RolloutResult] = []
+    agreements: list[dict[str, Any]] = []
+    tie_tolerance = float(config["exact_vccc_oracle"]["tie_tolerance"])
+    gamma = float(config["exact_vccc_oracle"]["margin_threshold"])
+    for ordinal, seed in enumerate(validated_seeds, 1):
+        native_baseline = _fast_rollout(
+            model,
+            seed,
+            mask_token_id=mask_id,
+            threshold=float(config["fast_dllm_baseline"]["threshold"]),
+            tie_tolerance=tie_tolerance,
+            policy=NATIVE_FAST_POLICY,
+            forward_convention=NATIVE_FAST_FORWARD_CONVENTION,
+            native_use_cache=True,
+            validate_source_t0=False,
+        )
+        native_baseline_results.append(native_baseline)
+        all_steps.extend(native_baseline.step_rows)
+        matched_baseline = _fast_rollout(
+            model,
+            seed,
+            mask_token_id=mask_id,
+            threshold=float(config["fast_dllm_baseline"]["threshold"]),
+            tie_tolerance=tie_tolerance,
+            policy=FAST_POLICY,
+            forward_convention=MATCHED_FAST_FORWARD_CONVENTION,
+            native_use_cache=False,
+            validate_source_t0=True,
+        )
+        matched_baseline_results.append(matched_baseline)
+        all_steps.extend(matched_baseline.step_rows)
+        prompt_oracles: list[RolloutResult] = []
+        for candidate_k in candidate_sizes:
+            oracle = _exact_oracle_rollout(
+                model,
+                seed,
+                mask_token_id=mask_id,
+                candidate_k=candidate_k,
+                subset_batch_size=int(config["execution"]["subset_batch_size"]),
+                gamma=gamma,
+                tie_tolerance=tie_tolerance,
+            )
+            oracle_results.append(oracle)
+            prompt_oracles.append(oracle)
+            all_steps.extend(oracle.step_rows)
+
+        # Flush every artifact needed to reconstruct this prompt's candidate
+        # pool, selected C_K, and terminal outcomes before marking it done.
+        raw_counts["exact_subset_context_rows"] += append_jsonl(
+            context_path, (row for oracle in prompt_oracles for row in oracle.context_rows)
+        )
+        raw_counts["exact_margin_query_rows"] += append_jsonl(
+            query_path, (row for oracle in prompt_oracles for row in oracle.query_rows)
+        )
+        prompt_results = [native_baseline, matched_baseline, *prompt_oracles]
+        raw_counts["policy_step_rows"] += append_jsonl(
+            policy_steps_path, (row for result in prompt_results for row in result.step_rows)
+        )
+        prompt_rollout_rows = [result.prompt_row() for result in prompt_results]
+        raw_counts["prompt_rollout_rows"] += append_jsonl(prompt_rollouts_path, prompt_rollout_rows)
+        prompt_agreements = [
+            *agreement_rows([native_baseline], prompt_oracles),
+            *agreement_rows([matched_baseline], prompt_oracles),
+        ]
+        agreements.extend(prompt_agreements)
+        raw_counts["final_output_agreement_rows"] += append_jsonl(agreement_path, prompt_agreements)
+        for oracle in prompt_oracles:
+            # These rows have just been flushed; do not retain every prompt's
+            # 2^K evidence in the Python process until the final report.
+            oracle.context_rows.clear()
+            oracle.query_rows.clear()
+        results_so_far = [*native_baseline_results, *matched_baseline_results, *oracle_results]
+        progress.update({
+            "completed_prompts": ordinal,
+            "last_completed_prompt_id": seed.prompt_id,
+            "raw_row_counts": dict(raw_counts),
+            "model_forward_evaluations_so_far": sum(
+                result.accounting.model_forward_evaluations for result in results_so_far
+            ),
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        })
+        write_json_atomic(output_root / "progress.json", progress)
+        print(json.dumps({
+            "stage": "policy_rollout",
+            "prompt": ordinal,
+            "total_prompts": len(validated_seeds),
+            "prompt_id": seed.prompt_id,
+            "native_fast_steps": native_baseline.accounting.policy_action_steps,
+            "matched_fast_steps": matched_baseline.accounting.policy_action_steps,
+            "model_forwards_so_far": sum(
+                result.accounting.model_forward_evaluations for result in results_so_far
+            ),
+            "raw_row_counts": raw_counts,
+        }, ensure_ascii=False))
+
+    all_results = [*native_baseline_results, *matched_baseline_results, *oracle_results]
+    prompt_rows = [result.prompt_row() for result in all_results]
+    throughput_rows = throughput_summary(prompt_rows, config)
+    batch_rows = commit_batch_summary(all_steps)
+    agreement_summary_rows = agreement_summary(agreements, config)
+    if bool(torch.cuda.is_available()):
+        _sync_cuda(torch)
         peak_vram_mib: float | None = float(torch.cuda.max_memory_allocated() / 2**20)
     else:
         peak_vram_mib = None
-    runtime_seconds = time.perf_counter() - wall_started
-    accounting_payload = {
-        "base_forwards": accounting.base_forwards,
-        "subset_context_forwards": accounting.subset_context_forwards,
-        "exact_forwards": accounting.exact_forwards,
-        "model_batch_calls": accounting.model_batch_calls,
-    }
-    context_count_by_state = Counter(str(row["state_key"]) for row in all_context_rows)
-    cost_rows = [{
-        "exact_cache_policy": "use_cache_false",
-        "base_forwards": accounting.base_forwards,
-        "subset_context_forwards": accounting.subset_context_forwards,
-        "total_exact_forwards": accounting.exact_forwards,
-        "model_batch_calls": accounting.model_batch_calls,
-        "evaluated_state_count": len(context_count_by_state),
-        "mean_exact_contexts_per_evaluated_state": (
-            math.fsum(context_count_by_state.values()) / len(context_count_by_state) if context_count_by_state else None
+    runtime_seconds = time.perf_counter() - runner_started
+    total_accounting = {
+        "action_forwards": sum(result.accounting.action_forwards for result in all_results),
+        "subset_context_forwards": sum(
+            result.accounting.subset_context_forwards for result in all_results
         ),
-        "runtime_seconds": runtime_seconds,
-        "peak_vram_mib": peak_vram_mib,
-        "interpretation": "Counterfactual verification cost only; never an end-to-end decoding speedup.",
-    }]
-    exclusions = [
-        row
-        for row in screening_rows
-        if row.get("status") not in {"selected_pending_fresh_exact_replay", "retained_after_fresh_exact_top1_validation"}
-    ] + [
-        row for row in all_pool_rows if row.get("pool_status") != "eligible"
+        "model_batch_calls": sum(result.accounting.model_batch_calls for result in all_results),
+        "failed_model_batch_calls": sum(result.accounting.failed_model_batch_calls for result in all_results),
+        "subset_oom_retries": sum(result.accounting.subset_oom_retries for result in all_results),
+        "committed_tokens": sum(result.accounting.committed_tokens for result in all_results),
+    }
+    total_accounting["model_forward_evaluations"] = (
+        int(total_accounting["action_forwards"]) + int(total_accounting["subset_context_forwards"])
+    )
+    exact_results = [
+        result for result in all_results if "use_cache_false" in result.forward_convention
     ]
+    total_accounting["exact_forward_evaluations"] = sum(
+        result.accounting.model_forward_evaluations for result in exact_results
+    )
     metadata: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "status": "completed_smoke" if args.smoke else "completed",
-        "audit_name": "exact_top1_vccc_oracle_headroom",
-        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "audit_name": "exact_top1_vccc_oracle_checking",
+        "started_at_utc": started_at_utc,
         "source_run_root": str(source_root),
         "source_run_status": source_manifest.get("status"),
         "source_commit": source_manifest.get("source_git_commit"),
         "frozen_model": config["model"]["name"],
-        "dtype": config["model"]["dtype"],
-        "model_snapshot_replay_verification": model_snapshot_replay_verification,
-        "actual_decoder_policy": config["decoder_policy"]["required_name"],
-        "actual_decoder_policy_unchanged": True,
-        "exact_cache_policy": "use_cache=False",
-        "margin_definition": "assigned raw logit minus maximum full-vocabulary competitor raw logit",
-        "tie_policy": "inclusive margin threshold plus deterministic torch.argmax must equal fixed top1 assignment",
+        "model_snapshot_replay_verification": snapshot_verification,
         "source_selection": source_selection_counts,
-        "selected_state_count": len(selected),
-        "selected_primary_state_count": sum(state.cohort == "primary" for state in selected),
-        "selected_hard_state_count": sum(state.cohort == "hard_exploratory" for state in selected),
-        "fresh_replay_retained_state_count": sum(row.get("status") == "retained_after_fresh_exact_top1_validation" for row in screening_rows),
-        "common_eligible_M4_M6_M8_state_count": len(common_eligible),
-        "forward_accounting": accounting_payload,
+        "validated_t0_seed_count": len(validated_seeds),
+        "worst_case_work_bounds": work_bounds,
+        "t0_exact_replay_validation": {
+            "status": "passed_for_every_matched_fast_control",
+            "checked_prompt_count": len(matched_baseline_results),
+            "comparison": "fresh_fixed_position_use_cache_false_top1_equals_archived_exact_t0_top1_for_every_generation_position",
+        },
+        "unmeasured_warmup": {
+            "exact_no_cache": {
+                "model_forward_evaluations": 1,
+                "model_batch_calls": 1,
+                "wall_seconds": exact_warmup_seconds,
+            },
+            "native_fast": {
+                "model_forward_evaluations": 1,
+                "model_batch_calls": 1,
+                "wall_seconds": native_warmup_seconds,
+            },
+            "excluded_from_policy_throughput": True,
+        },
+        "vectorized_margin_reducer_validation": reducer_validation,
+        "fast_dllm_baseline": {
+            "threshold": config["fast_dllm_baseline"]["threshold"],
+            "fallback_rule": config["fast_dllm_baseline"]["fallback_rule"],
+            "native_throughput_forward_convention": NATIVE_FAST_FORWARD_CONVENTION,
+            "matched_agreement_forward_convention": MATCHED_FAST_FORWARD_CONVENTION,
+        },
+        "exact_vccc_oracle": {
+            "candidate_sizes": list(candidate_sizes),
+            "candidate_rank": config["exact_vccc_oracle"]["candidate_rank"],
+            "selected_set_rule": config["exact_vccc_oracle"]["selected_set_rule"],
+            "gamma": gamma,
+            "tie_policy": "inclusive margin threshold plus deterministic argmax assignment match",
+            "forward_convention": EXACT_FORWARD_CONVENTION,
+        },
+        "forward_accounting": total_accounting,
+        "raw_artifact_row_counts": dict(raw_counts),
         "runtime_seconds": runtime_seconds,
         "peak_vram_mib": peak_vram_mib,
-        "ideal_nfe_interpretation": "A hypothetical cheap certificate predictor reproduces selected sets; exact verification forwards are excluded and no wall-clock speedup is claimed.",
-        "free_oracle_interpretation": "Upper bound only; it can omit actual Fast-dLLM B positions and is not safe-extension coverage.",
-        "prompt_split": {
-            "calibration_percent": config["matching"]["calibration_percent"],
-            "salt": config["matching"]["prompt_split_salt"],
-            "selection": "confidence tau chosen only on calibration prompts then evaluated on disjoint test prompts",
-        },
     }
-    write_jsonl(output_root / "raw" / "state_screening.jsonl", screening_rows)
-    write_jsonl(output_root / "raw" / "base_assignments.jsonl", all_base_rows)
-    write_jsonl(output_root / "raw" / "subset_contexts.jsonl", all_context_rows)
-    write_jsonl(output_root / "raw" / "subset_margin_queries.jsonl", all_query_rows)
-    write_jsonl(output_root / "raw" / "policy_state_results.jsonl", all_policy_rows)
-    write_jsonl(output_root / "raw" / "token_certificate_witnesses.jsonl", all_token_rows)
+    write_jsonl(output_root / "raw" / "prompt_selection.jsonl", screening_rows)
     tables: dict[str, Sequence[Mapping[str, Any]]] = {
-        "selection_accounting": screening_rows,
-        "state_pool_selection": all_pool_rows,
-        "policy_state_results": all_policy_rows,
-        "token_certificate_witnesses": all_token_rows,
-        "headroom_summary": summary_rows,
-        "confidence_sweep": sweep_rows,
-        "matched_risk_test": matched_rows,
-        "oracle_cost": cost_rows,
-        "exclusions": exclusions,
+        "prompt_selection": screening_rows,
+        "policy_steps": all_steps,
+        "prompt_rollouts": prompt_rows,
+        "throughput_summary": throughput_rows,
+        "commit_batch_summary": batch_rows,
+        "final_output_agreement": agreements,
+        "final_output_agreement_summary": agreement_summary_rows,
     }
     for name, rows in tables.items():
         write_csv(output_root / "tables" / f"{name}.csv", rows)
-    figures = write_figures(
+    figure_paths = write_figures(
         output_root / "figures",
-        summary_rows=summary_rows,
-        policy_rows=all_policy_rows,
-        accounting=accounting,
-        config=config,
+        throughput_rows=throughput_rows,
+        batch_rows=batch_rows,
+        agreement_rows_=[
+            row for row in agreement_summary_rows if row.get("baseline_policy") == NATIVE_FAST_POLICY
+        ],
     )
-    metadata["figure_paths"] = figures
+    metadata["figure_paths"] = figure_paths
     direct = write_report(
         output_root,
-        pool_rows=all_pool_rows,
-        summary_rows=summary_rows,
-        matched_rows=matched_rows,
         metadata=metadata,
+        throughput_rows=throughput_rows,
+        batch_rows=batch_rows,
+        agreement_rows_=agreement_summary_rows,
         config=config,
     )
-    metadata["direct_answer_summary"] = direct
+    metadata["direct_answers"] = direct
     write_json(output_root / "run_metadata.json", metadata)
-    write_json(output_root / "summary.json", {"status": metadata["status"], "metadata": metadata, "direct_answers": direct})
+    write_json(
+        output_root / "summary.json",
+        {"status": metadata["status"], "metadata": metadata, "direct_answers": direct},
+    )
+    progress.update({
+        "status": metadata["status"],
+        "completed_prompts": len(validated_seeds),
+        "raw_row_counts": dict(raw_counts),
+        "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+    })
+    write_json_atomic(output_root / "progress.json", progress)
     print(json.dumps({
         "status": metadata["status"],
         "output_root": str(output_root),
-        "forwards": accounting.exact_forwards,
+        "model_forwards": total_accounting["model_forward_evaluations"],
+        "exact_forwards": total_accounting["exact_forward_evaluations"],
         "runtime_seconds": runtime_seconds,
     }, ensure_ascii=False))
 

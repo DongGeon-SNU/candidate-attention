@@ -184,6 +184,37 @@ def confidence_selected_mask(probabilities: Sequence[float], threshold: float) -
     )
 
 
+def select_top_probability_margin_positions(
+    assignments: Mapping[int, Mapping[str, Any]], k: int
+) -> tuple[int, ...]:
+    """Return the current masked top-``k`` positions ranked by ``p1 - p2``.
+
+    This is deliberately a *probability* margin, not a raw-logit margin or a
+    top-1 confidence ranking.  Ties are resolved by physical position so the
+    candidate pool is deterministic even when a model returns equal values.
+    When fewer than ``k`` positions are supplied, every supplied position is
+    returned.  The tuple is in candidate-rank order, which makes its prefix
+    directly reusable for a K sweep.
+    """
+
+    if int(k) < 1:
+        raise ValueError("k must be at least one")
+    ranked: list[tuple[float, int]] = []
+    for raw_position, payload in assignments.items():
+        try:
+            position = int(raw_position)
+            top1 = float(payload["top1_probability"])
+            top2 = float(payload["top2_probability"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"position {raw_position!r} lacks finite top-1/top-2 probabilities") from error
+        margin = top1 - top2
+        if not math.isfinite(margin):
+            raise ValueError(f"position {position} has a non-finite p1-p2 probability margin")
+        ranked.append((margin, position))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return tuple(position for _margin, position in ranked[: int(k)])
+
+
 def set_log_probability(mask: int, probabilities: Sequence[float]) -> float:
     """Stable tie-break score for a selected set of fixed top-1 values."""
 
@@ -207,15 +238,29 @@ def choose_largest_safe_mask(
     positions: Sequence[int],
     *,
     required_mask: int = 0,
+    tie_scores: Sequence[float] | None = None,
 ) -> int | None:
     """Choose a maximum-cardinality exact-safe mask with prescribed ties.
 
-    Ties are resolved by higher summed fixed-top-1 log probability and then
-    ascending lexicographic position tuple, which is the requested deterministic
-    position-order fallback.
+    By default, historic headroom callers retain their summed fixed-top-1
+    log-probability tie break.  A caller can provide one ``tie_score`` per
+    pool position instead; the new top-``K`` rollout oracle uses p1-p2 scores
+    so ties among equally large safe sets preserve the requested ranking
+    signal.  Both variants end with ascending lexicographic physical position
+    order for a deterministic fallback.
     """
 
     required_mask = int(required_mask)
+    if len(probabilities) != len(positions):
+        raise ValueError("probabilities and positions must have equal length")
+    if tie_scores is not None:
+        if len(tie_scores) != len(positions):
+            raise ValueError("tie_scores and positions must have equal length")
+        normalized_tie_scores = tuple(float(value) for value in tie_scores)
+        if any(not math.isfinite(value) for value in normalized_tie_scores):
+            raise ValueError("tie_scores must be finite")
+    else:
+        normalized_tie_scores = None
     eligible = [
         mask
         for mask, certificate in certificates.items()
@@ -223,11 +268,19 @@ def choose_largest_safe_mask(
     ]
     if not eligible:
         return None
+
+    def score(mask: int) -> float:
+        if normalized_tie_scores is None:
+            return set_log_probability(int(mask), probabilities)
+        return math.fsum(
+            value for index, value in enumerate(normalized_tie_scores) if int(mask) & (1 << index)
+        )
+
     return sorted(
         eligible,
         key=lambda mask: (
             -int(mask).bit_count(),
-            -set_log_probability(int(mask), probabilities),
+            -score(int(mask)),
             _mask_position_tuple(int(mask), positions),
         ),
     )[0]
