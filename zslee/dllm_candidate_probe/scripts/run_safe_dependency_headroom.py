@@ -172,6 +172,14 @@ def _require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def _implementation_source_path(function: Callable[..., Any], label: str) -> Path:
+    """Resolve the decorated function's implementation, not its wrapper."""
+
+    source = inspect.getsourcefile(inspect.unwrap(function))
+    _require(source is not None, f"Could not resolve source path for {label}.")
+    return Path(source).resolve()
+
+
 def _git_head(path: Path) -> str:
     try:
         return subprocess.check_output(["git", "-C", str(path), "rev-parse", "HEAD"], text=True).strip()
@@ -338,11 +346,11 @@ def _import_observed_decoders(config: dict[str, Any]) -> dict[str, Any]:
 
     fast_generate = fast_module.generate
     _require(
-        Path(inspect.getsourcefile(fast_generate) or "").resolve() == fast_file.resolve(),
+        _implementation_source_path(fast_generate, "Fast-dLLM generate") == fast_file.resolve(),
         "Fast decoder did not resolve to vendor/Fast-dLLM/v1/llada/generate.py.",
     )
     _require(
-        Path(inspect.getsourcefile(generate_dapd) or "").resolve() == dapd_file.resolve(),
+        _implementation_source_path(generate_dapd, "DAPD generate") == dapd_file.resolve(),
         "DAPD decoder did not resolve to vendor/DAPD/dapd/generation.py.",
     )
     _require("step_observer" in inspect.signature(fast_generate).parameters, "Fast-dLLM source lacks required default-off step_observer; rerun setup.")

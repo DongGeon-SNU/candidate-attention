@@ -119,9 +119,9 @@ apply_observation_patch() {
 
   # Reverse-check first: it is the only safe idempotence test because a
   # patched vendor tree is intentionally dirty relative to its upstream pin.
-  if git -C "${repo_dir}" apply --reverse --check "${patch_file}"; then
+  if git -C "${repo_dir}" apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
     echo "${label} observation patch already applied"
-  elif git -C "${repo_dir}" apply --check "${patch_file}"; then
+  elif git -C "${repo_dir}" apply --check "${patch_file}" >/dev/null 2>&1; then
     git -C "${repo_dir}" apply --whitespace=nowarn "${patch_file}"
     echo "${label} observation patch applied"
   else

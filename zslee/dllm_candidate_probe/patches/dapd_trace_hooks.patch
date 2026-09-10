@@ -2,14 +2,19 @@ diff --git a/dapd/core.py b/dapd/core.py
 index 83abc89..a95efbe 100644
 --- a/dapd/core.py
 +++ b/dapd/core.py
-@@ -269,4 +269,6 @@ def select_independent_set(
+@@ -269,6 +269,8 @@ def select_independent_set(
      dependency: torch.Tensor,
      mask_index: torch.Tensor,
      tau: float,
 +    decision_observer=None,
 +    raw_dependency: Optional[torch.Tensor] = None,
  ) -> torch.Tensor:
-@@ -303,6 +305,10 @@ def select_independent_set(
+     """Greedy independent-set selection fixed to the paper DAPD rule.
+ 
+@@ -300,13 +302,41 @@ def select_independent_set(
+         sorted_positions = sorted_positions.tolist()
+         selected_positions = []
+ 
 -        for pos_item in sorted_positions:
 +        for candidate_rank, pos_item in enumerate(sorted_positions):
              can_select = True
@@ -21,11 +26,11 @@ index 83abc89..a95efbe 100644
 +                    decisive_blocker = sel_pos
 +                    decisive_normalized_score = float(dep_b[pos_item, sel_pos].item())
                      break
-@@ -310,3 +316,27 @@ def select_independent_set(
+ 
++            # Observation is additive and never feeds a value back into the
++            # selection rule. It exposes the exact first blocker evaluated by
++            # this loop rather than a reconstructed post-hoc blocker set.
 +            if decision_observer is not None:
-+                # Observation is additive and never feeds a value back into the
-+                # selection rule. It exposes the exact first blocker evaluated by
-+                # this loop rather than a reconstructed post-hoc blocker set.
 +                decisive_raw_score = None
 +                if decisive_blocker is not None and raw_dependency is not None:
 +                    decisive_raw_score = float(raw_dependency[b, pos_item, decisive_blocker].item())
@@ -53,14 +58,19 @@ diff --git a/dapd/generation.py b/dapd/generation.py
 index 2c65893..af4c51b 100644
 --- a/dapd/generation.py
 +++ b/dapd/generation.py
-@@ -125,4 +125,6 @@ def generate_dapd(
+@@ -125,6 +125,8 @@ def generate_dapd(
      verbose=False,
      alg="dapd_staged",
      collect_step_history=True,
 +    selection_observer=None,
 +    step_observer=None,
      **removed_options,
-@@ -208,8 +210,11 @@ def generate_dapd(
+ ):
+     """Generate with the paper DAPD algorithm."""
+@@ -205,14 +207,17 @@ def generate_dapd(
+                 greedy_mask_index = mask_index & ~direct_selected
+                 stats["direct_conf_unmasked_per_step"].append(direct_counts["direct_added"])
+ 
 -            selected = select_independent_set(
 +            graph_selected = select_independent_set(
                  confidence=confidence,
@@ -74,7 +84,13 @@ index 2c65893..af4c51b 100644
 -            selected = selected | direct_selected
 +            selected = graph_selected | direct_selected
 +            selected_before_staged = selected.clone()
-@@ -238,3 +241,31 @@ def generate_dapd(
+ 
+             if alg == "dapd_staged":
+                 progress = 1.0 - (remaining_masks / gen_length)
+@@ -235,6 +240,34 @@ def generate_dapd(
+                     selected[b, t] = True
+                 num_selected = int(selected.sum().item())
+ 
 +            if step_observer is not None:
 +                # CPU primitives prevent an observer from mutating decoder
 +                # tensors. The callback runs after every official selection

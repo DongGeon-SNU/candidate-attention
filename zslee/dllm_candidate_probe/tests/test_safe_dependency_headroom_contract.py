@@ -64,6 +64,10 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         self.assertIn("selection_observer", source)
         self.assertIn("_capture_fast_native_selection_without_step_observer", source)
         self.assertIn("native_selection_trace_equal", source)
+        # Fast-dLLM's public generate entry point is decorated with
+        # torch.no_grad(); checking the wrapper file would falsely resolve to
+        # PyTorch rather than the pinned implementation.
+        self.assertIn("inspect.unwrap(function)", source)
 
     def test_dapd_patch_exposes_first_blocker_and_step_observation(self) -> None:
         patch = DAPD_PATCH.read_text(encoding="utf-8")
@@ -118,6 +122,7 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         # so setup is deterministic and idempotent on a persistent H100 disk.
         self.assertIn("apply --check", setup)
         self.assertIn("apply --reverse --check", setup)
+        self.assertIn("apply --reverse --check \"${patch_file}\" >/dev/null 2>&1", setup)
         self.assertIn("patched_files_sha256", setup)
         # Setup's byte comparison covers the initial patch. The runner must
         # additionally reject a vendor edit made after setup completed.
