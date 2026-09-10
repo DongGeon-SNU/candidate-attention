@@ -1,0 +1,39 @@
+diff --git a/v1/llada/generate.py b/v1/llada/generate.py
+index 96fa45e..ba22182 100644
+--- a/v1/llada/generate.py
++++ b/v1/llada/generate.py
+@@ -85,6 +85,6 @@ def get_num_transfer_tokens(block_mask_index: torch.Tensor, steps: int) -> torch
+ @ torch.no_grad()
+ def generate(model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
+-             remasking='low_confidence', mask_id=126336, threshold=None, factor=None):
++             remasking='low_confidence', mask_id=126336, threshold=None, factor=None, step_observer=None):
+     '''
+     Args:
+         model: Mask predictor.
+@@ -120,6 +120,26 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
+                 x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, i] if threshold is None else None, threshold)
+             else:
+                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
++            if step_observer is not None:
++                # The callback receives copied CPU primitives after the native
++                # Fast-dLLM transfer rule and before the unchanged mutation.
++                # It has no return value and cannot alter x/x0/transfer_index.
++                step_observer(
++                    {
++                        "decode_step": int(nfe - 1),
++                        "block_index": int(num_block),
++                        "masked_position_count": int(mask_index.sum().item()),
++                        "mask_positions": tuple(
++                            int(value) for value in mask_index[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "selected_positions": tuple(
++                            int(value) for value in transfer_index[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "selected_token_ids": tuple(
++                            int(value) for value in x0[0, transfer_index[0]].detach().cpu().tolist()
++                        ),
++                    }
++                )
+             x[transfer_index] = x0[transfer_index]
+             i += 1
+             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:

@@ -1,0 +1,108 @@
+diff --git a/dapd/core.py b/dapd/core.py
+index 83abc89..a95efbe 100644
+--- a/dapd/core.py
++++ b/dapd/core.py
+@@ -269,4 +269,6 @@ def select_independent_set(
+     dependency: torch.Tensor,
+     mask_index: torch.Tensor,
+     tau: float,
++    decision_observer=None,
++    raw_dependency: Optional[torch.Tensor] = None,
+ ) -> torch.Tensor:
+@@ -303,6 +305,10 @@ def select_independent_set(
+-        for pos_item in sorted_positions:
++        for candidate_rank, pos_item in enumerate(sorted_positions):
+             can_select = True
++            decisive_blocker = None
++            decisive_normalized_score = None
+             for sel_pos in selected_positions:
+                 if dep_b[pos_item, sel_pos] > tau:
+                     can_select = False
++                    decisive_blocker = sel_pos
++                    decisive_normalized_score = float(dep_b[pos_item, sel_pos].item())
+                     break
+@@ -310,3 +316,27 @@ def select_independent_set(
++            if decision_observer is not None:
++                # Observation is additive and never feeds a value back into the
++                # selection rule. It exposes the exact first blocker evaluated by
++                # this loop rather than a reconstructed post-hoc blocker set.
++                decisive_raw_score = None
++                if decisive_blocker is not None and raw_dependency is not None:
++                    decisive_raw_score = float(raw_dependency[b, pos_item, decisive_blocker].item())
++                decision_observer(
++                    {
++                        "batch_index": int(b),
++                        "candidate_position": int(pos_item),
++                        "candidate_rank": int(candidate_rank),
++                        "selected_positions_before": tuple(int(value) for value in selected_positions),
++                        "accepted": bool(can_select),
++                        "decisive_blocker_position": (
++                            None if decisive_blocker is None else int(decisive_blocker)
++                        ),
++                        "normalized_dependency_score": decisive_normalized_score,
++                        "raw_attention_dependency_score": decisive_raw_score,
++                        "edge_threshold": float(tau),
++                        "combined_selection_score": float(combined_score[b, pos_item].item()),
++                    }
++                )
++
+             if can_select:
+                 selected_positions.append(pos_item)
+                 selected[b, pos_item] = True
+diff --git a/dapd/generation.py b/dapd/generation.py
+index 2c65893..af4c51b 100644
+--- a/dapd/generation.py
++++ b/dapd/generation.py
+@@ -125,4 +125,6 @@ def generate_dapd(
+     verbose=False,
+     alg="dapd_staged",
+     collect_step_history=True,
++    selection_observer=None,
++    step_observer=None,
+     **removed_options,
+@@ -208,8 +210,11 @@ def generate_dapd(
+-            selected = select_independent_set(
++            graph_selected = select_independent_set(
+                 confidence=confidence,
+                 dependency_score=dependency_scores,
+                 dependency=dependency,
+                 mask_index=greedy_mask_index,
+                 tau=current_tau,
++                decision_observer=selection_observer,
++                raw_dependency=raw_dependency,
+             )
+-            selected = selected | direct_selected
++            selected = graph_selected | direct_selected
++            selected_before_staged = selected.clone()
+@@ -238,3 +241,31 @@ def generate_dapd(
++            if step_observer is not None:
++                # CPU primitives prevent an observer from mutating decoder
++                # tensors. The callback runs after every official selection
++                # stage and immediately before the unchanged state update.
++                step_observer(
++                    {
++                        "decode_step": int(step),
++                        "masked_position_count": int(remaining_masks),
++                        "mask_positions": tuple(
++                            int(value) for value in mask_index[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "graph_selected_positions": tuple(
++                            int(value) for value in graph_selected[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "direct_selected_positions": tuple(
++                            int(value) for value in direct_selected[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "staged_added_positions": tuple(
++                            int(value) for value in (selected & ~selected_before_staged)[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "selected_positions": tuple(
++                            int(value) for value in selected[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
++                        ),
++                        "edge_threshold": float(current_tau),
++                        "algorithm": alg,
++                    }
++                )
++
+             if collect_step_history:
+                 selected_positions = selected.nonzero(as_tuple=False).tolist()
+                 stats["step_positions"].append(selected_positions)

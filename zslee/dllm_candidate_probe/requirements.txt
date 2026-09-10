@@ -1,6 +1,8 @@
 # Install only inside zslee/dllm_candidate_probe/.venv on the shared-GPU volume.
-# The CUDA-compatible torch wheel is selected by scripts/setup.sh for its target.
-transformers>=4.51,<5
+# The CUDA-compatible torch wheel is selected and pinned by scripts/setup.sh.
+# Fast-dLLM v1 itself pins this version; keeping the project aligned prevents
+# setup from silently installing then downgrading Transformers.
+transformers==4.49.0
 huggingface_hub>=0.30
 safetensors>=0.5
 PyYAML>=6.0

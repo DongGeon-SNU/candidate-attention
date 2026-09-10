@@ -1,7 +1,12 @@
+schema_version: safe_dependency_headroom/v2
+run:
+  id_prefix: sdh-v2-full
 model:
   name: GSAI-ML/LLaDA-8B-Instruct
-  hf_revision: main
+  # Full immutable Hugging Face commit, never a moving branch such as main.
+  hf_revision: 08b83a6feb34df1a6011b80c3c00c7563e963b07
   dtype: bfloat16
+  fast_dllm_commit: a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b
   dapd_repo: https://github.com/quasar529/DAPD.git
   dapd_commit: 05727b08da4cb4008a275123d7d9885dd5714f7c
 decoding:
@@ -16,7 +21,10 @@ decoding:
   mask_id: 126336
   eos_policy: fixed_generation_length_no_early_stop
   position_indexing: absolute_prompt_plus_generation_offset
-  use_cache: false
+  # The upstream generation APIs do not expose a cache switch.  The runner
+  # fails closed unless this remains the native source-default policy.
+  use_cache_policy: native_source_default
+  prompt_encoding_policy: project_chat_template_then_default_tokenizer_call
 dapd:
   algorithm: dapd_direct
   layer_ratio: 0.3
@@ -24,9 +32,25 @@ dapd:
   tau_max: 0.05
 prompts: []
 prompt_file: prompts/safe_dependency_headroom_primary.jsonl
+prompt_file_sha256: 5b426ecd0d7c7c56623142b597073fa96bf6806b399ffdff7a1102edae5ecb14
 analysis:
   bootstrap_replicates: 10000
   bootstrap_seed: 20260911
   dependency_bins: [0.0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0000001]
+integrity:
+  # A full cohort verifies one source-observer A/B pair before collecting the
+  # remaining prompt traces; every prompt still gets trace reconstruction.
+  verify_prompt_limit: 1
+baselines:
+  active: [fast_dllm, dapd]
+  demask:
+    status: blocked_no_official_predictor_or_checkpoint
+    reason: official DEMASK predictor source, compatible checkpoint, backbone interface, and tau configuration are unavailable in this checkout
+    required_assets:
+      - official predictor source
+      - exact official checkpoint
+      - supported backbone revision and hidden-state interface
+      - official tau and selection configuration
 storage:
-  output_root: results/safe_dependency_headroom_full
+  raw_root: results/raw
+  summary_root: results/summary

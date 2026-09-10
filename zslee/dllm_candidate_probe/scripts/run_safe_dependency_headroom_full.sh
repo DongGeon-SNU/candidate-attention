@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
@@ -7,8 +8,6 @@ if [[ ! -x "$ROOT/.venv/bin/python" ]]; then
   exit 2
 fi
 
-# Keep model/tokenizer resolution and Python's hashing policy on the durable
-# project volume. The runner records these choices in its per-run manifest.
 export HF_HOME="$ROOT/cache/huggingface"
 export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 export TRANSFORMERS_CACHE="$HF_HOME/transformers"
@@ -16,4 +15,4 @@ export PYTHONHASHSEED="${PYTHONHASHSEED:-0}"
 export CUBLAS_WORKSPACE_CONFIG="${CUBLAS_WORKSPACE_CONFIG:-:4096:8}"
 
 exec "$ROOT/.venv/bin/python" scripts/run_safe_dependency_headroom.py \
-  --config configs/safe_dependency_headroom_smoke.yaml
+  --config configs/safe_dependency_headroom_full.yaml "$@"
