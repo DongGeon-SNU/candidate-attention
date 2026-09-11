@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "scripts" / "run_safe_dependency_headroom.py"
 SETUP = PROJECT_ROOT / "scripts" / "setup.sh"
 DAPD_PATCH = PROJECT_ROOT / "patches" / "dapd_trace_hooks.patch"
+DAPD_TOP1_PATCH = PROJECT_ROOT / "patches" / "dapd_top1_trace_hook.patch"
 FAST_PATCH = PROJECT_ROOT / "patches" / "fast_dllm_trace_hooks.patch"
 CONFIGS = (
     PROJECT_ROOT / "configs" / "safe_dependency_headroom_smoke.yaml",
@@ -62,6 +63,9 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         self.assertIn("generate_dapd", source)
         self.assertIn("step_observer", source)
         self.assertIn("selection_observer", source)
+        self.assertIn("top1_token_i_at_decision", source)
+        self.assertIn("top1_to_dapd_terminal_agreement_count", source)
+        self.assertIn("top1_to_fast_terminal_agreement_count", source)
         self.assertIn("_capture_fast_native_selection_without_step_observer", source)
         self.assertIn("native_selection_trace_equal", source)
         # Fast-dLLM's public generate entry point is decorated with
@@ -82,6 +86,12 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         self.assertIn("decisive_blocker_position", patch)
         self.assertIn("raw_attention_dependency_score", patch)
 
+    def test_dapd_top1_patch_exposes_same_forward_mask_snapshot(self) -> None:
+        patch = DAPD_TOP1_PATCH.read_text(encoding="utf-8")
+        self.assertIn("dapd/generation.py", patch)
+        self.assertIn("mask_top1_token_ids", patch)
+        self.assertIn("predictions[0, mask_index[0]]", patch)
+
     def test_fast_patch_exposes_an_observation_only_step_hook(self) -> None:
         patch = FAST_PATCH.read_text(encoding="utf-8")
         self.assertIn("v1/llada/generate.py", patch)
@@ -92,7 +102,7 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         self.assertRegex(patch, r"step_observer\s*=\s*None")
 
     def test_observation_patches_are_well_formed_unified_diffs(self) -> None:
-        for patch_path in (DAPD_PATCH, FAST_PATCH):
+        for patch_path in (DAPD_PATCH, DAPD_TOP1_PATCH, FAST_PATCH):
             with self.subTest(patch=patch_path.name):
                 # --numstat parses hunks but does not modify the checkout.  It
                 # catches truncated/corrupt hand-written patches before setup
@@ -117,13 +127,21 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         setup = SETUP.read_text(encoding="utf-8")
         runner = RUNNER.read_text(encoding="utf-8")
         self.assertIn("dapd_trace_hooks.patch", setup)
+        self.assertIn("dapd_top1_trace_hook.patch", setup)
         self.assertIn("fast_dllm_trace_hooks.patch", setup)
+        self.assertIn("DAPD observation patch bundle already applied", setup)
+        self.assertIn('safe_dependency_headroom/source-manifest/v3', setup)
+        self.assertLess(
+            setup.index('apply --reverse --check "${PATCH_DIR}/dapd_top1_trace_hook.patch"'),
+            setup.index('apply_observation_patch "DAPD" "${DAPD_DIR}" "${PATCH_DIR}/dapd_trace_hooks.patch"'),
+        )
         # Verify both pristine applicability and the already-applied case,
         # so setup is deterministic and idempotent on a persistent H100 disk.
         self.assertIn("apply --check", setup)
         self.assertIn("apply --reverse --check", setup)
         self.assertIn("apply --reverse --check \"${patch_file}\" >/dev/null 2>&1", setup)
         self.assertIn("patched_files_sha256", setup)
+        self.assertIn("observation_patch_files", setup)
         # Setup's byte comparison covers the initial patch. The runner must
         # additionally reject a vendor edit made after setup completed.
         self.assertIn("_verify_runtime_patch_provenance", runner)
@@ -153,6 +171,7 @@ class SafeDependencyHeadroomContractTest(unittest.TestCase):
         for path in CONFIGS:
             with self.subTest(config=path.name):
                 config = path.read_text(encoding="utf-8")
+                self.assertIn("schema_version: safe_dependency_headroom/v3", config)
                 revision = _mapping_scalar(config, "model", "hf_revision")
                 self.assertRegex(revision, r"^[0-9a-fA-F]{7,64}$")
                 self.assertNotIn(revision.lower(), {"main", "master", "latest", "head"})

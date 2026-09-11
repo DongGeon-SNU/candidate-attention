@@ -133,16 +133,28 @@ apply_observation_patch() {
 verify_exact_patch_state() {
   local label="$1"
   local repo_dir="$2"
-  local patch_file="$3"
-  local expected_commit="$4"
+  local expected_commit="$3"
+  shift 3
+  local patch_file
+  local -a patch_files=("$@")
   local scratch
   scratch="$(mktemp -d)"
+
+  if [[ "${#patch_files[@]}" -eq 0 ]]; then
+    rm -rf -- "${scratch}"
+    echo "${label} has no required observation patches." >&2
+    exit 2
+  fi
 
   # First reject extra tracked changes. Then reconstruct exactly the expected
   # patched files from the pinned commit in a disposable tree and byte-compare
   # them with the vendor checkout. This prevents a partially compatible local
   # edit from being mistaken for a verified observation-only source patch.
-  mapfile -t expected_paths < <(sed -n 's#^+++ b/##p' "${patch_file}" | sort)
+  mapfile -t expected_paths < <(
+    for patch_file in "${patch_files[@]}"; do
+      sed -n 's#^+++ b/##p' "${patch_file}"
+    done | sort -u
+  )
   mapfile -t actual_paths < <(git -C "${repo_dir}" diff --name-only | sort)
   if [[ "${#expected_paths[@]}" -eq 0 ]] || \
      [[ "${#expected_paths[@]}" -ne "${#actual_paths[@]}" ]] || \
@@ -153,13 +165,20 @@ verify_exact_patch_state() {
   fi
 
   if ! git -C "${repo_dir}" archive "${expected_commit}" | tar -x -C "${scratch}" || \
-     ! git -C "${scratch}" init -q || \
-     ! git -C "${scratch}" apply --check "${patch_file}" || \
-     ! git -C "${scratch}" apply --whitespace=nowarn "${patch_file}"; then
+     ! git -C "${scratch}" init -q; then
     rm -rf -- "${scratch}"
     echo "Could not reconstruct the expected ${label} patched source tree." >&2
     exit 2
   fi
+
+  for patch_file in "${patch_files[@]}"; do
+    if ! git -C "${scratch}" apply --check "${patch_file}" || \
+       ! git -C "${scratch}" apply --whitespace=nowarn "${patch_file}"; then
+      rm -rf -- "${scratch}"
+      echo "Could not apply the expected ${label} observation patch: ${patch_file}" >&2
+      exit 2
+    fi
+  done
 
   for expected_path in "${expected_paths[@]}"; do
     if ! cmp -s "${repo_dir}/${expected_path}" "${scratch}/${expected_path}"; then
@@ -174,9 +193,19 @@ verify_exact_patch_state() {
 ensure_pinned_checkout "Fast-dLLM" "${FAST_REPO}" "${FAST_DIR}" "${FAST_COMMIT}"
 ensure_pinned_checkout "DAPD" "${DAPD_REPO}" "${DAPD_DIR}" "${DAPD_COMMIT}"
 apply_observation_patch "Fast-dLLM" "${FAST_DIR}" "${PATCH_DIR}/fast_dllm_trace_hooks.patch"
-apply_observation_patch "DAPD" "${DAPD_DIR}" "${PATCH_DIR}/dapd_trace_hooks.patch"
-verify_exact_patch_state "Fast-dLLM" "${FAST_DIR}" "${PATCH_DIR}/fast_dllm_trace_hooks.patch" "${FAST_COMMIT}"
-verify_exact_patch_state "DAPD" "${DAPD_DIR}" "${PATCH_DIR}/dapd_trace_hooks.patch" "${DAPD_COMMIT}"
+# The additive top-1 patch modifies a hunk introduced by the v2 DAPD patch.
+# Therefore, on an already-v3 checkout the base patch alone no longer passes
+# git-apply's reverse check. The additive patch is the v3-state sentinel; the
+# exact bundle verifier below then proves the full tracked result.
+if git -C "${DAPD_DIR}" apply --reverse --check "${PATCH_DIR}/dapd_top1_trace_hook.patch" >/dev/null 2>&1; then
+  echo "DAPD observation patch bundle already applied"
+else
+  apply_observation_patch "DAPD" "${DAPD_DIR}" "${PATCH_DIR}/dapd_trace_hooks.patch"
+  apply_observation_patch "DAPD top-1 snapshot" "${DAPD_DIR}" "${PATCH_DIR}/dapd_top1_trace_hook.patch"
+fi
+verify_exact_patch_state "Fast-dLLM" "${FAST_DIR}" "${FAST_COMMIT}" "${PATCH_DIR}/fast_dllm_trace_hooks.patch"
+verify_exact_patch_state "DAPD" "${DAPD_DIR}" "${DAPD_COMMIT}" \
+  "${PATCH_DIR}/dapd_trace_hooks.patch" "${PATCH_DIR}/dapd_top1_trace_hook.patch"
 
 # A patch that merely applies is not sufficient evidence that the runner's
 # callbacks are available. Check the exact public hook names before installing
@@ -187,6 +216,7 @@ if ! grep -Fq "step_observer" "${FAST_DIR}/v1/llada/generate.py"; then
 fi
 if ! grep -Fq "selection_observer" "${DAPD_DIR}/dapd/generation.py" || \
    ! grep -Fq "step_observer" "${DAPD_DIR}/dapd/generation.py" || \
+   ! grep -Fq "mask_top1_token_ids" "${DAPD_DIR}/dapd/generation.py" || \
    ! grep -Fq "decision_observer" "${DAPD_DIR}/dapd/core.py"; then
   echo "DAPD observation hooks missing after patch application." >&2
   exit 2
@@ -204,7 +234,7 @@ printf '%s\n' "${DAPD_HEAD}" > "${PROBE_ROOT}/outputs/dapd_commit.txt"
 "${PYTHON_BIN}" -m pip install -r "${FAST_DIR}/v1/requirements.txt"
 
 FAST_PATCH_SHA256="$(sha256sum "${PATCH_DIR}/fast_dllm_trace_hooks.patch" | awk '{print $1}')"
-DAPD_PATCH_SHA256="$(sha256sum "${PATCH_DIR}/dapd_trace_hooks.patch" | awk '{print $1}')"
+DAPD_PATCH_SHA256="$(cat "${PATCH_DIR}/dapd_trace_hooks.patch" "${PATCH_DIR}/dapd_top1_trace_hook.patch" | sha256sum | awk '{print $1}')"
 FAST_GENERATE_SHA256="$(sha256sum "${FAST_DIR}/v1/llada/generate.py" | awk '{print $1}')"
 DAPD_CORE_SHA256="$(sha256sum "${DAPD_DIR}/dapd/core.py" | awk '{print $1}')"
 DAPD_GENERATION_SHA256="$(sha256sum "${DAPD_DIR}/dapd/generation.py" | awk '{print $1}')"
@@ -219,7 +249,7 @@ from datetime import datetime, timezone
 
 destination = sys.argv[1]
 payload = {
-    "schema_version": "safe_dependency_headroom/source-manifest/v2",
+    "schema_version": "safe_dependency_headroom/source-manifest/v3",
     "created_at_utc": datetime.now(timezone.utc).isoformat(),
     "python": platform.python_version(),
     "torch_install": {
@@ -231,6 +261,7 @@ payload = {
             "expected_commit": os.environ["FAST_COMMIT"],
             "resolved_commit": os.environ["FAST_HEAD"],
             "observation_patch_sha256": os.environ["FAST_PATCH_SHA256"],
+            "observation_patch_files": ["fast_dllm_trace_hooks.patch"],
             "patched_files_sha256": {
                 "v1/llada/generate.py": os.environ["FAST_GENERATE_SHA256"],
             },
@@ -239,6 +270,7 @@ payload = {
             "expected_commit": os.environ["DAPD_COMMIT"],
             "resolved_commit": os.environ["DAPD_HEAD"],
             "observation_patch_sha256": os.environ["DAPD_PATCH_SHA256"],
+            "observation_patch_files": ["dapd_trace_hooks.patch", "dapd_top1_trace_hook.patch"],
             "patched_files_sha256": {
                 "dapd/core.py": os.environ["DAPD_CORE_SHA256"],
                 "dapd/generation.py": os.environ["DAPD_GENERATION_SHA256"],

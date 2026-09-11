@@ -1,0 +1,13 @@
+diff --git a/dapd/generation.py b/dapd/generation.py
+--- a/dapd/generation.py
++++ b/dapd/generation.py
+@@ -248,6 +248,9 @@ def generate_dapd(
+                         "mask_positions": tuple(
+                             int(value) for value in mask_index[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
+                         ),
++                        "mask_top1_token_ids": tuple(
++                            int(value) for value in predictions[0, mask_index[0]].detach().cpu().tolist()
++                        ),
+                         "graph_selected_positions": tuple(
+                             int(value) for value in graph_selected[0].nonzero(as_tuple=True)[0].detach().cpu().tolist()
+                         ),

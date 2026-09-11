@@ -1,6 +1,6 @@
-schema_version: safe_dependency_headroom/v2
+schema_version: safe_dependency_headroom/v3
 run:
-  id_prefix: sdh-v2-full
+  id_prefix: sdh-v3-full
 model:
   name: GSAI-ML/LLaDA-8B-Instruct
   # Full immutable Hugging Face commit, never a moving branch such as main.

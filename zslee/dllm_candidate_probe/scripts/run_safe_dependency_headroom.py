@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe Dependency Headroom / Terminal Token Agreement audit (schema v2).
+"""Safe Dependency Headroom / decision-time top-1 and terminal agreement audit (schema v3).
 
 The runner has no decoder loop, selector replay, oracle, or surrogate.  It
 calls only the pinned upstream Fast-dLLM and DAPD functions.  Setup applies
@@ -35,7 +35,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = "safe_dependency_headroom/v2"
+SCHEMA_VERSION = "safe_dependency_headroom/v3"
 ACTIVE_BASELINES = {"fast_dllm", "dapd"}
 AGREEMENT_LABELS = {0: "0/2 match", 1: "1/2 match", 2: "2/2 match"}
 COMMON_OUTPUT_FIELDS = [
@@ -56,7 +56,7 @@ RAW_CSV_SCHEMAS = {
         "block_index", "mask_positions", "selected_token_ids",
     ],
     "dapd_steps": COMMON_OUTPUT_FIELDS + [
-        "mask_positions", "graph_selected_positions", "direct_selected_positions",
+        "mask_positions", "mask_top1_token_ids", "graph_selected_positions", "direct_selected_positions",
         "staged_added_positions", "edge_threshold", "algorithm",
         "selector_decision_count", "selector_rejection_count",
     ],
@@ -67,6 +67,7 @@ RAW_CSV_SCHEMAS = {
         "graph_selected_positions", "direct_selected_positions", "staged_added_positions",
         "selection_stage", "selected_in_graph_selector",
         "selected_in_step_after_algorithm", "eligible_for_headroom",
+        "top1_token_i_at_decision", "top1_token_j_at_decision",
     ],
     "dapd_events": COMMON_OUTPUT_FIELDS + [
         "event_id", "event_kind", "position_i", "position_j",
@@ -77,7 +78,12 @@ RAW_CSV_SCHEMAS = {
         "selected_in_graph_selector", "selected_in_step_after_algorithm",
         "eligible_for_headroom", "dapd_token_i", "dapd_token_j", "fast_token_i",
         "fast_token_j", "match_i", "match_j", "match_both", "agreement_count",
-        "agreement_category",
+        "agreement_category", "top1_token_i_at_decision", "top1_token_j_at_decision",
+        "top1_to_dapd_terminal_match_i", "top1_to_dapd_terminal_match_j",
+        "top1_to_dapd_terminal_match_both", "top1_to_dapd_terminal_agreement_count",
+        "top1_to_dapd_terminal_agreement_category", "top1_to_fast_terminal_match_i",
+        "top1_to_fast_terminal_match_j", "top1_to_fast_terminal_match_both",
+        "top1_to_fast_terminal_agreement_count", "top1_to_fast_terminal_agreement_category",
     ],
     "dapd_pairs": COMMON_OUTPUT_FIELDS + [
         "event_id", "pair_row_index", "pair_role", "position_i", "position_j",
@@ -87,6 +93,12 @@ RAW_CSV_SCHEMAS = {
         "combined_selection_score", "exclusion_reason", "selection_stage",
         "dapd_token_i", "dapd_token_j", "fast_token_i", "fast_token_j", "match_i",
         "match_j", "match_both", "agreement_count", "agreement_category",
+        "top1_token_i_at_decision", "top1_token_j_at_decision",
+        "top1_to_dapd_terminal_match_i", "top1_to_dapd_terminal_match_j",
+        "top1_to_dapd_terminal_match_both", "top1_to_dapd_terminal_agreement_count",
+        "top1_to_dapd_terminal_agreement_category", "top1_to_fast_terminal_match_i",
+        "top1_to_fast_terminal_match_j", "top1_to_fast_terminal_match_both",
+        "top1_to_fast_terminal_agreement_count", "top1_to_fast_terminal_agreement_category",
     ],
     "outputs": [
         "run_id", "prompt_id", "seed", "baseline", "final_output_token_ids", "decoded_text",
@@ -124,6 +136,13 @@ def _sha256_text(value: str) -> str:
 
 def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _patch_bundle_sha256(paths: Iterable[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -429,13 +448,16 @@ def _verify_runtime_patch_provenance(config: dict[str, Any], api: dict[str, Any]
         (
             "fast_dllm",
             config["model"]["fast_dllm_commit"],
-            ROOT / "patches" / "fast_dllm_trace_hooks.patch",
+            (ROOT / "patches" / "fast_dllm_trace_hooks.patch",),
             {"v1/llada/generate.py": api["fast_file"]},
         ),
         (
             "dapd",
             config["model"]["dapd_commit"],
-            ROOT / "patches" / "dapd_trace_hooks.patch",
+            (
+                ROOT / "patches" / "dapd_trace_hooks.patch",
+                ROOT / "patches" / "dapd_top1_trace_hook.patch",
+            ),
             {
                 "dapd/core.py": api["dapd_core_file"],
                 "dapd/generation.py": api["dapd_file"],
@@ -443,11 +465,18 @@ def _verify_runtime_patch_provenance(config: dict[str, Any], api: dict[str, Any]
         ),
     )
     actual: dict[str, Any] = {}
-    for label, expected_commit, patch_path, source_files in checks:
+    for label, expected_commit, patch_paths, source_files in checks:
         source = setup_sources.get(label)
         _require(isinstance(source, dict), f"Setup source manifest lacks {label} provenance.")
         _require(source.get("expected_commit") == expected_commit == source.get("resolved_commit"), f"Setup manifest {label} commit does not match current config pin.")
-        _require(source.get("observation_patch_sha256") == _sha256_file(patch_path), f"Setup manifest {label} patch hash differs from tracked patch; rerun setup.")
+        _require(
+            source.get("observation_patch_sha256") == _patch_bundle_sha256(patch_paths),
+            f"Setup manifest {label} patch hash differs from tracked patch bundle; rerun setup.",
+        )
+        _require(
+            source.get("observation_patch_files") == [path.name for path in patch_paths],
+            f"Setup manifest {label} patch-file list differs from the tracked patch bundle; rerun setup.",
+        )
         expected_file_hashes = source.get("patched_files_sha256")
         _require(isinstance(expected_file_hashes, dict), f"Setup manifest {label} lacks patched file hashes; rerun setup.")
         actual[label] = {}
@@ -561,12 +590,18 @@ class _DapdTraceCollector:
         row["masked_position_count"] = int(row["masked_position_count"])
         for name in (
             "mask_positions",
+            "mask_top1_token_ids",
             "graph_selected_positions",
             "direct_selected_positions",
             "staged_added_positions",
             "selected_positions",
         ):
             row[name] = _as_int_list(row.get(name), name)
+        _require(
+            len(row["mask_positions"]) == len(row["mask_top1_token_ids"]),
+            "DAPD step observer reported a top-1 snapshot that does not align with masked positions.",
+        )
+        decision_top1_by_position = dict(zip(row["mask_positions"], row["mask_top1_token_ids"]))
         row["edge_threshold"] = float(row["edge_threshold"])
         row["selector_decision_count"] = len(self.pending)
         row["selector_rejection_count"] = sum(not bool(decision["accepted"]) for decision in self.pending)
@@ -574,6 +609,16 @@ class _DapdTraceCollector:
 
         for decision in self.pending:
             candidate = int(decision["candidate_position"])
+            _require(
+                candidate in decision_top1_by_position,
+                "DAPD selector candidate is missing from the pre-update masked top-1 snapshot.",
+            )
+            blocker = decision.get("decisive_blocker_position")
+            if blocker is not None:
+                _require(
+                    int(blocker) in decision_top1_by_position,
+                    "DAPD decisive blocker is missing from the pre-update masked top-1 snapshot.",
+                )
             selected_in_graph = candidate in graph_selected
             selected_in_step = candidate in final_selected
             _require(
@@ -591,6 +636,10 @@ class _DapdTraceCollector:
                 "selection_stage": "greedy_independent_set",
                 "selected_in_graph_selector": selected_in_graph,
                 "selected_in_step_after_algorithm": selected_in_step,
+                "top1_token_i_at_decision": int(decision_top1_by_position[candidate]),
+                "top1_token_j_at_decision": (
+                    None if blocker is None else int(decision_top1_by_position[int(blocker)])
+                ),
                 # A later step may still commit this position.  Only a same
                 # step direct/staged/fallback addition removes this exact
                 # co-commit exclusion from the primary headroom denominator.
@@ -852,11 +901,22 @@ def _enrich_dapd_events(
         record = {**common, **row, "baseline": "dapd"}
         i, j = int(record["position_i"]) - prompt_length, int(record["position_j"]) - prompt_length
         _require(0 <= i < len(dapd_ids) and 0 <= j < len(dapd_ids), "DAPD blocker pair is outside generation indexing.")
+        top1_i, top1_j = record.get("top1_token_i_at_decision"), record.get("top1_token_j_at_decision")
+        _require(
+            isinstance(top1_i, int) and isinstance(top1_j, int),
+            "DAPD rejection event lacks the pair's pre-update decision-time top-1 tokens.",
+        )
         match_i, match_j = bool(dapd_ids[i] == fast_ids[i]), bool(dapd_ids[j] == fast_ids[j])
         agreement_count = int(match_i) + int(match_j)
+        top1_to_dapd_match_i, top1_to_dapd_match_j = bool(top1_i == dapd_ids[i]), bool(top1_j == dapd_ids[j])
+        top1_to_dapd_count = int(top1_to_dapd_match_i) + int(top1_to_dapd_match_j)
+        top1_to_fast_match_i, top1_to_fast_match_j = bool(top1_i == fast_ids[i]), bool(top1_j == fast_ids[j])
+        top1_to_fast_count = int(top1_to_fast_match_i) + int(top1_to_fast_match_j)
         record.update({
             "position_i_generation": i,
             "position_j_generation": j,
+            "top1_token_i_at_decision": int(top1_i),
+            "top1_token_j_at_decision": int(top1_j),
             "dapd_token_i": int(dapd_ids[i]),
             "dapd_token_j": int(dapd_ids[j]),
             "fast_token_i": int(fast_ids[i]),
@@ -866,15 +926,28 @@ def _enrich_dapd_events(
             "match_both": bool(match_i and match_j),
             "agreement_count": agreement_count,
             "agreement_category": AGREEMENT_LABELS[agreement_count],
+            "top1_to_dapd_terminal_match_i": top1_to_dapd_match_i,
+            "top1_to_dapd_terminal_match_j": top1_to_dapd_match_j,
+            "top1_to_dapd_terminal_match_both": bool(top1_to_dapd_match_i and top1_to_dapd_match_j),
+            "top1_to_dapd_terminal_agreement_count": top1_to_dapd_count,
+            "top1_to_dapd_terminal_agreement_category": AGREEMENT_LABELS[top1_to_dapd_count],
+            "top1_to_fast_terminal_match_i": top1_to_fast_match_i,
+            "top1_to_fast_terminal_match_j": top1_to_fast_match_j,
+            "top1_to_fast_terminal_match_both": bool(top1_to_fast_match_i and top1_to_fast_match_j),
+            "top1_to_fast_terminal_agreement_count": top1_to_fast_count,
+            "top1_to_fast_terminal_agreement_category": AGREEMENT_LABELS[top1_to_fast_count],
         })
         result.append(record)
     return result
 
 
-def _rates(events: list[dict[str, Any]]) -> dict[str, float | None]:
+def _rates(
+    events: list[dict[str, Any]],
+    count_field: str = "agreement_count",
+) -> dict[str, float | None]:
     if not events:
         return {AGREEMENT_LABELS[count]: None for count in (0, 1, 2)}
-    counts = Counter(int(event["agreement_count"]) for event in events)
+    counts = Counter(int(event[count_field]) for event in events)
     return {AGREEMENT_LABELS[count]: float(counts[count] / len(events)) for count in (0, 1, 2)}
 
 
@@ -883,12 +956,13 @@ def _bootstrap_prompt_clusters(
     prompt_ids: list[str],
     replicates: int,
     seed: int,
+    count_field: str = "agreement_count",
 ) -> dict[str, Any]:
     """Resample every input prompt, including the zero-event clusters."""
 
     groups: dict[str, list[int]] = {prompt_id: [] for prompt_id in prompt_ids}
     for event in events:
-        groups[str(event["prompt_id"])].append(int(event["agreement_count"]))
+        groups[str(event["prompt_id"])].append(int(event[count_field]))
     rng, indexes = np.random.default_rng(seed), np.arange(len(prompt_ids))
     draws = {0: [], 1: [], 2: []}
     undefined = 0
@@ -915,6 +989,51 @@ def _bootstrap_prompt_clusters(
             for category in (0, 1, 2)
         },
     }
+
+
+def _comparison_summary(
+    events: list[dict[str, Any]],
+    prompt_ids: list[str],
+    config: dict[str, Any],
+    count_field: str,
+    description: str,
+) -> dict[str, Any]:
+    return {
+        "description": description,
+        "event_cohort": "same_step_headroom_eligible_actual_rejection_events",
+        "event_count": len(events),
+        "agreement_rates": _rates(events, count_field),
+        "prompt_bootstrap_95_ci": _bootstrap_prompt_clusters(
+            events,
+            prompt_ids,
+            int(config["analysis"]["bootstrap_replicates"]),
+            int(config["analysis"]["bootstrap_seed"]),
+            count_field,
+        ),
+    }
+
+
+def _pair_token_comparison_rows(comparisons: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for comparison, payload in comparisons.items():
+        rates = payload["agreement_rates"]
+        ci = payload["prompt_bootstrap_95_ci"]["95_ci"]
+        rows.append({
+            "comparison": comparison,
+            "description": payload["description"],
+            "event_cohort": payload["event_cohort"],
+            "event_count": payload["event_count"],
+            "agreement_0_rate": rates["0/2 match"],
+            "agreement_1_rate": rates["1/2 match"],
+            "agreement_2_rate": rates["2/2 match"],
+            "agreement_0_ci_low": None if ci["0/2 match"] is None else ci["0/2 match"][0],
+            "agreement_0_ci_high": None if ci["0/2 match"] is None else ci["0/2 match"][1],
+            "agreement_1_ci_low": None if ci["1/2 match"] is None else ci["1/2 match"][0],
+            "agreement_1_ci_high": None if ci["1/2 match"] is None else ci["1/2 match"][1],
+            "agreement_2_ci_low": None if ci["2/2 match"] is None else ci["2/2 match"][0],
+            "agreement_2_ci_high": None if ci["2/2 match"] is None else ci["2/2 match"][1],
+        })
+    return rows
 
 
 def _summarize_dapd(events: list[dict[str, Any]], prompt_ids: list[str], config: dict[str, Any]) -> dict[str, Any]:
@@ -954,6 +1073,29 @@ def _summarize_dapd(events: list[dict[str, Any]], prompt_ids: list[str], config:
             int(config["analysis"]["bootstrap_replicates"]),
             int(config["analysis"]["bootstrap_seed"]),
         ),
+        "pair_token_comparisons": {
+            "dapd_terminal_vs_fast_terminal": _comparison_summary(
+                eligible,
+                prompt_ids,
+                config,
+                "agreement_count",
+                "DAPD terminal pair tokens versus same-input Fast-dLLM terminal pair tokens.",
+            ),
+            "decision_top1_vs_dapd_terminal": _comparison_summary(
+                eligible,
+                prompt_ids,
+                config,
+                "top1_to_dapd_terminal_agreement_count",
+                "DAPD pair top-1 tokens from the rejection decision forward versus DAPD terminal pair tokens.",
+            ),
+            "decision_top1_vs_fast_terminal": _comparison_summary(
+                eligible,
+                prompt_ids,
+                config,
+                "top1_to_fast_terminal_agreement_count",
+                "DAPD pair top-1 tokens from the rejection decision forward versus same-input Fast-dLLM terminal pair tokens.",
+            ),
+        },
     }
 
 
@@ -1055,13 +1197,18 @@ def _source_manifest(
                 "expected_commit": config["model"]["fast_dllm_commit"],
                 "resolved_commit": _git_head(api["fast_root"]),
                 "imported_file": str(api["fast_file"]),
-                "patch_sha256": _sha256_file(ROOT / "patches" / "fast_dllm_trace_hooks.patch"),
+                "patch_sha256": _patch_bundle_sha256((ROOT / "patches" / "fast_dllm_trace_hooks.patch",)),
+                "patch_files": ["fast_dllm_trace_hooks.patch"],
             },
             "dapd": {
                 "expected_commit": config["model"]["dapd_commit"],
                 "resolved_commit": _git_head(api["dapd_root"]),
                 "imported_file": str(api["dapd_file"]),
-                "patch_sha256": _sha256_file(ROOT / "patches" / "dapd_trace_hooks.patch"),
+                "patch_sha256": _patch_bundle_sha256((
+                    ROOT / "patches" / "dapd_trace_hooks.patch",
+                    ROOT / "patches" / "dapd_top1_trace_hook.patch",
+                )),
+                "patch_files": ["dapd_trace_hooks.patch", "dapd_top1_trace_hook.patch"],
             },
         },
         "runtime_patch_verification": patch_provenance,
@@ -1097,7 +1244,7 @@ def main() -> None:
     prompts = _load_prompts(config)
     prompt_ids = [prompt["prompt_id"] for prompt in prompts]
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_id = args.run_id or f"{config.get('run', {}).get('id_prefix', 'sdh-v2')}-{stamp}-{uuid.uuid4().hex[:8]}"
+    run_id = args.run_id or f"{config.get('run', {}).get('id_prefix', 'sdh-v3')}-{stamp}-{uuid.uuid4().hex[:8]}"
     _require(re.fullmatch(r"[A-Za-z0-9._-]+", run_id) is not None, "run_id has unsupported characters.")
     raw_dir = _under_project(str(config["storage"]["raw_root"]), "storage.raw_root") / run_id
     summary_dir = _under_project(str(config["storage"]["summary_root"]), "storage.summary_root") / run_id
@@ -1230,6 +1377,10 @@ def main() -> None:
         for name, path in raw_files.items():
             _write_csv(path.with_suffix(".csv"), _read_jsonl(path), RAW_CSV_SCHEMAS[name])
         dapd_summary = _summarize_dapd(all_events, prompt_ids, config)
+        _write_csv(
+            summary_dir / "dapd_pair_token_comparisons.csv",
+            _pair_token_comparison_rows(dapd_summary["pair_token_comparisons"]),
+        )
         fast_summary = {
             "schema_version": SCHEMA_VERSION,
             "baseline": "fast_dllm",
@@ -1279,6 +1430,7 @@ def main() -> None:
             "dapd_headroom_eligible_rejection_events": dapd_summary["headroom_eligible_rejection_events"],
             "instrumentation_equivalence_records": len(all_equivalence),
             "dapd_dependency_plot": plot_status,
+            "dapd_pair_token_comparisons": str(summary_dir / "dapd_pair_token_comparisons.csv"),
         })
         _write_json(summary_dir / "run_manifest.json", manifest)
         print(json.dumps({

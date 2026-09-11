@@ -1,11 +1,13 @@
-# Safe Dependency Headroom / Terminal Token Agreement
+# Safe Dependency Headroom / Decision-Time Top-1 and Terminal Token Agreement
 
 This is a pre-validity experiment: when an official dependency-avoidance
-decoder declines to co-commit a position, does that position actually finish
-with a different token from its same-input Fast-dLLM rollout? It is **not** an
-implementation of VCCC, a sequential-reveal oracle, a new heuristic, or
-predictor training. DAPD and DEMASK are each compared independently with
-Fast-dLLM; they are not compared with one another.
+decoder declines to co-commit a position, how do the pair's frozen DAPD
+decision-time top-1 tokens compare with their eventual DAPD and same-input
+Fast-dLLM terminal tokens? It is **not** an implementation of VCCC, a
+sequential-reveal oracle, a new heuristic, or predictor training. In
+particular, terminal agreement is observational and does not certify that a
+rejected pair could safely have been co-committed. DAPD and DEMASK are each
+compared independently with Fast-dLLM; they are not compared with one another.
 
 ## Frozen and shared conditions
 
@@ -24,7 +26,7 @@ per-run manifest:
   pretending that `use_cache` was honored.
 
 The setup pins Fast-dLLM to `a9b81e4caa240c8cad4f7dc1889ff4852a0fca5b` and
-DAPD to `05727b08da4cb4008a275123d7d9885dd5714f7c`. It applies two small,
+DAPD to `05727b08da4cb4008a275123d7d9885dd5714f7c`. It applies three small,
 tracked, default-off observation-hook patches under `patches/`. The patched
 functions retain the upstream selection and decoding logic; callbacks only
 receive already-computed primitive values. Before smoke data are accepted, the
@@ -53,7 +55,7 @@ version drift from setup's dependency freeze.
 ## Declared decoding values
 
 The YAML files are the authoritative, copied-into-provenance configuration.
-For quick review, both v2 configurations declare `remasking=low_confidence`,
+For quick review, both v3 configurations declare `remasking=low_confidence`,
 Fast-dLLM `threshold=0.9`, `mask_id=126336`, `temperature=0.0`, and
 `top_p=null`. DAPD uses its published `dapd_direct` algorithm with
 `layer_ratio=0.3`, `tau_min=0.01`, and `tau_max=0.05`; the actual per-step
@@ -73,12 +75,27 @@ threshold, and selection stage. A candidate that is eventually added by a
 separate direct/fallback stage is retained for provenance but excluded from the
 primary "not co-committed" headroom denominator.
 
-Each eligible event compares the DAPD terminal token at candidate and blocker
-positions against the corresponding Fast-dLLM terminal output. It is assigned
-exactly one category: `2/2 match`, `1/2 match`, or `0/2 match`. Bootstrap
-resampling is by the full input-prompt cohort, including prompts with zero
-rejection events. Replicates with no sampled events are marked undefined, not
-silently converted to zero.
+For every rejection event, the observation hook copies the two positions'
+top-1 token IDs from the exact native DAPD forward that produced the rejection,
+before the decoder updates its state. The raw event and pair records therefore
+contain three aligned pair snapshots:
+
+- `top1_token_i_at_decision`, `top1_token_j_at_decision`: candidate and first
+  blocker top-1 IDs at the rejection decision;
+- `dapd_token_i`, `dapd_token_j`: their terminal IDs after the unmodified DAPD
+  rollout; and
+- `fast_token_i`, `fast_token_j`: their terminal IDs after the same-input
+  Fast-dLLM rollout.
+
+The summary separately reports 0/2, 1/2, and 2/2 endpoint agreement for
+decision-top-1 versus DAPD terminal, decision-top-1 versus Fast terminal, and
+the pre-existing DAPD-terminal versus Fast-terminal comparison. Like the v2
+primary metric, these summaries use only actual rejection events whose
+candidate was not later added in the same decoder step; the raw event and pair
+logs retain every graph-selector rejection. Bootstrap resampling is by the
+full input-prompt cohort, including prompts with zero rejection events.
+Replicates with no sampled events are marked undefined, not silently converted
+to zero.
 
 The run writes durable JSONL raw records as prompts complete and materializes
 CSV/Parquet-compatible tabular logs below:
@@ -89,8 +106,9 @@ results/summary/<run_id>/
 ```
 
 The summary directory contains baseline JSON/CSV summaries, a manifest,
-prompt-clustered bootstrap intervals, and a DAPD normalized-dependency-bin
-agreement plot. It also contains a DEMASK blocker artifact where applicable.
+prompt-clustered bootstrap intervals, `dapd_pair_token_comparisons.csv`, and a
+DAPD normalized-dependency-bin terminal-agreement plot. It also contains a
+DEMASK blocker artifact where applicable.
 
 ## H100 commands
 
@@ -137,5 +155,6 @@ than emitting an invalid comparison.
 Any earlier `results/safe_dependency_headroom_*` result is exploratory only.
 That runner reconstructed decoder loops and expanded blocker-pair rows after
 the fact, so its "rejection event" counts and bootstrap denominator do not
-meet this v2 protocol. Do not pool it with, or cite it as, a v2 terminal-token
-agreement estimate. Re-run the smoke command above after updating the source.
+meet the v2 protocol. Do not pool it with, or cite it as, a v2 terminal-token
+agreement estimate. The completed v2 runs also lack decision-time top-1
+snapshots, so do not pool them with the v3 triple-comparison outputs.

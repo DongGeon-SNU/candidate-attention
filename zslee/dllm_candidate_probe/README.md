@@ -31,16 +31,17 @@ bash scripts/run_smoke.sh
 bash scripts/run_pilot.sh
 ```
 
-## Safe Dependency Headroom / Terminal Token Agreement
+## Safe Dependency Headroom / Decision-Time Top-1 and Terminal Token Agreement
 
-The v2 DAPD-vs-Fast-dLLM terminal-token agreement instrumentation, immutable
-source/model pins, source-observer patch verification, and fail-closed DEMASK
-asset requirement are documented in
+The v3 DAPD rejection-pair decision-time-top-1, DAPD-terminal, and
+Fast-dLLM-terminal comparison instrumentation, immutable source/model pins,
+source-observer patch verification, and fail-closed DEMASK asset requirement
+are documented in
 [`SAFE_DEPENDENCY_HEADROOM.md`](SAFE_DEPENDENCY_HEADROOM.md). After
 `scripts/setup.sh`, run the five-prompt H100 smoke test with
 `bash scripts/run_safe_dependency_headroom_smoke.sh`. Setup writes
 `outputs/safe_dependency_headroom_source_manifest.json`; do not use a prior v1
-headroom result as a v2 estimate.
+or v2 headroom result as a v3 triple-comparison estimate.
 
 Each command creates a timestamped file under `logs/`. The smoke stage uses one prompt and one low-parallel decoding state with branch microbatch one. It measures GPU peak allocation and timing and writes `outputs/resource_estimate.md`. The pilot command will refuse to start unless that estimate is at most 30 minutes; it then uses at most ten prompts and two collected states per prompt.
 
